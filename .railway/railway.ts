@@ -13,8 +13,7 @@ export default defineRailway(() => {
     deploy: {
       healthcheckPath: "/health",
       healthcheckTimeout: 60,
-      restartPolicyType: "ON_FAILURE",
-      restartPolicyMaxRetries: 10,
+      // Railway represents its ON_FAILURE / 10 retries policy by omitting both fields.
     },
     env: {
       ADMIN_IDS: preserve(),
