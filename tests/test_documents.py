@@ -66,13 +66,23 @@ class DocumentsTest(unittest.TestCase):
         self.assertIn('Всего порций 10', production)
         self.assertIn('Позиций 1', production)
         self.assertIn('Накладных к печати 2', report)
-        self.assertIn('разница -0,5 ₸', report)
+        self.assertIn('Разница, ₸', report)
+        self.assertIn('№ 009 · Точка & Зал 99,5 99 -0,5', ' '.join(report.split()))
         printed = pages(invoices)
         self.assertEqual(len(printed), 1)
         self.assertIn('Доставка 08.10.2026', printed[0])
         for token in ['Накладная № 009','Накладная № 10','(ОБМЕН)','Итого к оплате: 99 ₸', self.dish, 'Курьер:']:
             self.assertIn(token, printed[0])
         self.assertNotIn('Накладная № 11', printed[0])
+
+    def test_print_templates_use_neutral_ink(self):
+        for document in self.render(self.rows):
+            for page in PdfReader(BytesIO(document)).pages:
+                for operands, operator in page.get_contents().operations:
+                    if operator.lower() == b'k':
+                        self.assertEqual(list(operands[:3]), [0, 0, 0])
+                    elif operator.lower() == b'rg':
+                        self.assertEqual(len(set(operands)), 1)
 
     def test_long_invoice_retains_lines_and_single_total(self):
         lines = [row(1,'Точка & Зал',self.dish,1,100,100,15000,15000) for _ in range(150)]

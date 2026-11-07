@@ -157,11 +157,9 @@ def parse_workbook(data: bytes) -> list[dict]:
 W, H = A4
 M = 31
 WIDTH = W - 2 * M
-INK = colors.HexColor('#1b242b')
-MUTED = colors.HexColor('#42535a')
-LIGHT = colors.HexColor('#e8edef')
-RULE = colors.HexColor('#b5c0c4')
-DEEP = colors.HexColor('#254951')
+INK = colors.CMYKColor(0, 0, 0, 1)
+MUTED = colors.CMYKColor(0, 0, 0, .80)
+RULE = colors.CMYKColor(0, 0, 0, .52)
 
 
 @lru_cache(maxsize=1)
@@ -198,10 +196,10 @@ def _cell(pdf, p, x, top, width):
     return top - h
 
 
-def _rule(pdf, x1, y, x2, dashed=False):
+def _rule(pdf, x1, y, x2, dashed=False, *, weight=0.55, color=RULE):
     pdf.saveState()
-    pdf.setStrokeColor(RULE)
-    pdf.setLineWidth(0.5)
+    pdf.setStrokeColor(color)
+    pdf.setLineWidth(weight)
     if dashed:
         pdf.setDash(4, 3)
     pdf.line(x1, y, x2, y)
@@ -237,15 +235,18 @@ def _production_pdf(receipts, catalog, collected, delivery):
         groups[section].append((names[key], count))
 
     def plan_heading():
-        _cell(pdf, _para('План производства', 22, True), M, H-M, WIDTH)
-        _cell(pdf, _para(f'Готовим на {delivery:%d.%m.%Y}', 16, True), M, H-M-33, WIDTH)
-        _cell(pdf, _para(f'Заявки собраны {collected:%d.%m.%Y}', 10, color=MUTED), M, H-M-56, WIDTH)
-        _cell(pdf, _para(f'Всего порций  {sum(counts.values())}     /     Позиций  {len(counts)}', 13, True), M, H-M-77, WIDTH)
+        _cell(pdf, _para('План производства', 24, True), M, H-M, WIDTH)
+        _cell(pdf, _para(f'Готовим на {delivery:%d.%m.%Y}', 17, True), M, H-M-38, WIDTH*.57)
+        _cell(pdf, _para(f'Заявки собраны {collected:%d.%m.%Y}', 11), M, H-M-63, WIDTH*.57)
+        summary_left = M + WIDTH*.58
+        _cell(pdf, _para(f'Всего порций {sum(counts.values())}', 15, True, True),
+              summary_left, H-M-40, WIDTH*.42)
+        _cell(pdf, _para(f'Позиций {len(counts)}', 11, right=True), summary_left, H-M-63, WIDTH*.42)
 
     plan_heading()
-    gutter = 19
+    gutter = 22
     cw = (WIDTH-gutter)/2
-    top = H - M - 109
+    top = H - M - 94
     col = 0
     y = top
 
@@ -261,24 +262,32 @@ def _production_pdf(receipts, catalog, collected, delivery):
     def group_heading(section, total, continued=False):
         x = M+col*(cw+gutter)
         title = section + (' (прод.)' if continued else '')
-        p = _para(title, 10, True, color=colors.white)
-        h = max(21, p.wrap(cw-52, H)[1]+8)
-        pdf.setFillColor(DEEP)
-        pdf.rect(x, y-h, cw, h, fill=1, stroke=0)
-        _cell(pdf, p, x+5, y-4, cw-50)
-        _cell(pdf, _para(total, 10, True, True, colors.white), x+cw-44, y-4, 38)
+        p = _para(title, 13, True)
+        units = _para(f'{total} шт.', 11, True, True)
+        h = max(p.wrap(cw-70, H)[1], units.wrap(65, H)[1]) + 10
+        _rule(pdf, x, y, x+cw, weight=1.3, color=INK)
+        _cell(pdf, p, x, y-5, cw-70)
+        _cell(pdf, units, x+cw-65, y-6, 65)
+        _rule(pdf, x, y-h, x+cw)
         return y-h
 
     entries = []
-    width = cw-41
+    qty_width = 40
+    width = cw-qty_width-8
     for section in dict.fromkeys([*catalog['sections'], *groups]):
         items = sorted(groups.get(section, ()), key=lambda v: (-v[1], v[0].casefold()))
         if not items:
             continue
         total = sum(q for _, q in items)
-        paragraphs = [(_para(name, 11), q) for name,q in items]
-        heading_h = max(21, _para(section, 10, True).wrap(cw-52,H)[1]+8)
-        height = heading_h + sum(p.wrap(width, H)[1]+7 for p, _ in paragraphs) + 10
+        paragraphs = []
+        for name, qty in items:
+            label = _para(name, 11.5)
+            number = _para(qty, 12.5, True, True)
+            row_h = max(label.wrap(width,H)[1], number.wrap(qty_width,H)[1]) + 7
+            paragraphs.append((label, number, row_h))
+        heading_h = max(_para(section, 13, True).wrap(cw-70,H)[1],
+                        _para(f'{total} шт.', 11, True).wrap(65,H)[1]) + 10
+        height = heading_h + sum(row_h for _, _, row_h in paragraphs) + 13
         entries.append((section, total, paragraphs, heading_h, height))
     # When the plan fits on one sheet, balance the columns at a section heading.
     total_height = sum(entry[4] for entry in entries)
@@ -290,114 +299,173 @@ def _production_pdf(receipts, catalog, collected, delivery):
             candidates.append((abs(2*heights-total_height), pos))
     split_at = min(candidates)[1] if candidates else None
     for pos, (section, total, paragraphs, heading_h, _) in enumerate(entries):
-        first_h = paragraphs[0][0].wrap(width,H)[1] + 7
+        first_h = paragraphs[0][2]
         if pos == split_at:
             next_column()
         if y-heading_h-first_h < 39:
             next_column()
         y = group_heading(section, total)
-        for p, qty in paragraphs:
-            row_h = p.wrap(width,H)[1]+7
+        for label, number, row_h in paragraphs:
             if y-row_h < 39:
                 next_column()
                 y = group_heading(section, total, True)
             x = M+col*(cw+gutter)
-            _cell(pdf, p, x+3, y-4, width)
-            _cell(pdf, _para(qty, 10, True, True), x+cw-35, y-3, 31)
+            _cell(pdf, label, x, y-3, width)
+            _cell(pdf, number, x+cw-qty_width, y-2, qty_width)
             y -= row_h
             _rule(pdf, x, y, x+cw)
-        y -= 10
+        y -= 13
     _sheet_footer(pdf, 'Кухня')
     pdf.showPage()
 
     def report_heading():
         _cell(pdf, _para('Отчёт по выгрузке', 22, True), M, H-M, WIDTH)
         _cell(pdf, _para(_dates(collected, delivery), 10, color=MUTED), M, H-M-33, WIDTH)
-        return H-M-67
+        return H-M-59
 
     y = report_heading()
 
-    def report_line(s, size=11, bold=False):
+    def new_report_page():
         nonlocal y
-        p = _para(s, size, bold)
-        if y - p.wrap(WIDTH,H)[1] < 39:
-            _sheet_footer(pdf, 'Контроль выгрузки')
-            pdf.showPage()
-            y = report_heading()
-        y = _cell(pdf,p,M,y,WIDTH)-7
+        _sheet_footer(pdf, 'Контроль выгрузки')
+        pdf.showPage()
+        y = report_heading()
+
+    def section_title(label, room=24):
+        nonlocal y
+        if y - 34 - room < 39:
+            new_report_page()
+        y -= 9
+        _rule(pdf, M, y, W-M)
+        y = _cell(pdf, _para(label, 13, True), M, y-6, WIDTH)-4
 
     included, excluded = [], []
     for r in receipts:
         info = catalog['points'].get(r['point'].casefold(), {})
         (excluded if info.get('excluded') else included).append(r)
-    report_line(f'Чеков в Excel    {len(receipts)}')
-    report_line(f'Накладных к печати    {len(included)}')
-    report_line(f'Порций в плане    {sum(counts.values())}')
-    report_line(f'Разных блюд    {len(counts)}')
-    y -= 7
-    report_line('Исключены из накладных', 13, True)
-    for point in sorted({r['point'] for r in excluded},key=str.casefold) or ['Нет']:
-        report_line(point)
-    y -= 7
-    report_line('Итоги по напечатанным накладным', 13, True)
-    for label, field in [('Сумма товаров','gross'),('Скидка по чекам','discount'),('К оплате','paid')]:
-        report_line(f'{label}    {_amount(sum(Decimal(r[field]) for r in included))} ₸')
-    y -= 7
-    report_line('Расхождения по чекам', 13, True)
-    report_line('Разница = «Оплачено» минус сумма итоговых цен товарных строк.', 9)
-    differences = 0
+    half = WIDTH/2
+    for left, right in [
+        (f'Чеков в Excel  {len(receipts)}', f'Накладных к печати  {len(included)}'),
+        (f'Порций в плане  {sum(counts.values())}', f'Разных блюд  {len(counts)}')
+    ]:
+        bottom_left = _cell(pdf, _para(left, 12, True), M, y, half-8)
+        bottom_right = _cell(pdf, _para(right, 12, True), M+half, y, half)
+        y = min(bottom_left, bottom_right)-6
+
+    section_title('Исключены из накладных')
+    for point in sorted({r['point'] for r in excluded}, key=str.casefold) or ['Нет']:
+        p = _para(point, 11)
+        if y - p.wrap(WIDTH, H)[1] < 39:
+            new_report_page()
+            section_title('Исключены из накладных (продолжение)')
+        y = _cell(pdf, p, M, y, WIDTH)-5
+
+    section_title('Итоги по напечатанным накладным', room=66)
+    for label, field in [('Сумма товаров', 'gross'), ('Скидка по чекам', 'discount'), ('К оплате', 'paid')]:
+        total = _amount(sum(Decimal(r[field]) for r in included))
+        bottom_label = _cell(pdf, _para(label, 11, field == 'paid'), M, y, half)
+        bottom_total = _cell(pdf, _para(total + ' ₸', 11, field == 'paid', True), M+half, y, half)
+        y = min(bottom_label, bottom_total)-5
+
+    section_title('Расхождения по чекам', room=83)
+    y = _cell(pdf, _para('Разница = «Оплачено» минус сумма итоговых цен товарных строк.', 10),
+              M, y, WIDTH)-8
+    widths = (WIDTH-239, 83, 83, 73)
+
+    def discrepancy_row(values, heading=False, measure=False):
+        cells = [_para(text, 9 if heading else 10, heading or i == 3, i > 0)
+                 for i, text in enumerate(values)]
+        height = max(p.wrap(w-8, H)[1] for p, w in zip(cells, widths))+9
+        if not measure:
+            x = M
+            for p, w in zip(cells, widths):
+                _cell(pdf, p, x+4, y-4, w-8)
+                x += w
+            _rule(pdf, M, y-height, W-M)
+        return height
+
+    labels = ('Чек и точка', 'По строкам, ₸', 'Оплачено, ₸', 'Разница, ₸')
+    show_labels = True
     for r in receipts:
         lines = sum(Decimal(line['total']) for line in r['lines'])
         paid = Decimal(r['paid'])
-        if lines != paid:
-            differences += 1
-            report_line(f'№ {r["id"]}   {r["point"]}   ·   строки {_amount(lines)} ₸, оплачено {_amount(paid)} ₸, разница {_amount(paid-lines)} ₸', 10)
-    if not differences:
-        report_line('Расхождений нет.')
+        if lines == paid:
+            continue
+        row = (f'№ {r["id"]}  ·  {r["point"]}', _amount(lines), _amount(paid), _amount(paid-lines))
+        row_height = discrepancy_row(row, measure=True)
+        required = row_height + (discrepancy_row(labels, heading=True, measure=True) if show_labels else 0)
+        if y-required < 39:
+            new_report_page()
+            section_title('Расхождения по чекам (продолжение)')
+            show_labels = True
+        if show_labels:
+            y -= discrepancy_row(labels, heading=True)
+            show_labels = False
+        y -= discrepancy_row(row)
+    if show_labels:
+        _cell(pdf, _para('Расхождений нет.', 11), M, y, WIDTH)
     _sheet_footer(pdf, 'Контроль выгрузки')
     pdf.save()
     return out.getvalue()
 
-INVOICE_WIDTHS = (23, WIDTH-23-34-54-54-69, 34, 54, 54, 69)
+INVOICE_WIDTHS = (23, WIDTH - 23 - 43 - 57 - 58 - 72, 43, 57, 58, 72)
 
 
 def _table_row(pdf, cells, x, top, heading=False):
-    paragraphs = [_para(v, 8.2 if not heading else 8, heading, i >= 2) for i, v in enumerate(cells)]
-    heights = [p.wrap(w-6, H)[1] for p,w in zip(paragraphs, INVOICE_WIDTHS)]
-    h = max(heights)+5
-    if pdf:
+    sizes = (8.5,) * 6 if heading else (8.5, 10, 10.5, 9.5, 9.5, 9.5)
+    paragraphs = [_para(value, sizes[i], bold=heading or i == 2, right=i >= 2)
+                  for i, value in enumerate(cells)]
+    height = max(p.wrap(w - 6, H)[1] for p, w in zip(paragraphs, INVOICE_WIDTHS)) + 4
+    if pdf is not None:
         if heading:
-            pdf.setFillColor(LIGHT)
-            pdf.rect(x, top-h, WIDTH, h, stroke=0, fill=1)
-        for p,w in zip(paragraphs, INVOICE_WIDTHS):
-            _cell(pdf, p, x+3, top-2, w-6)
-            x += w
-        _rule(pdf,M,top-h,W-M)
-    return h
+            _rule(pdf, M, top, W - M)
+        for paragraph, width in zip(paragraphs, INVOICE_WIDTHS):
+            _cell(pdf, paragraph, x + 3, top - 2, width - 6)
+            x += width
+        _rule(pdf, M, top - height, W - M)
+    return height
 
 
-def _invoice_header(pdf, top, r, info, dates, part=0):
+def _invoice_header(pdf, top, r, info, collected, delivery, part=0):
     title = f'Накладная № {r["id"]}' + (f'  ·  Продолжение {part}' if part else '')
-    y = _cell(pdf, _para(title, 14, True), M, top, WIDTH) - 2
-    y = _cell(pdf, _para(dates, 8.5, color=MUTED), M, y, WIDTH) - 3
-    y = _cell(pdf, _para('Точка: ' + info.get('name', r['point']), 10, True), M, y, WIDTH) - 2
-    y = _cell(pdf, _para('Адрес: ' + (info.get('address') or '______________________________'), 9), M, y, WIDTH) - 4
-    return y-_table_row(pdf, ('№', 'Наименование', 'Кол-во', 'Цена', 'Скидка', 'Итого'), M, y, True)
+    date_width = 142
+    left_width = WIDTH - date_width - 12
+    date_x = W - M - date_width
+    title_end = _cell(pdf, _para(title, 12, True), M, top, left_width)
+    date_end = _cell(pdf, _para(f'Доставка {delivery:%d.%m.%Y}', 11, True, True),
+                     date_x, top, date_width)
+    y = min(title_end, date_end) - 4
+    point_end = _cell(pdf, _para(info.get('name', r['point']), 15, True), M, y, left_width)
+    collected_end = _cell(pdf, _para(f'Сбор заявок {collected:%d.%m.%Y}', 9, right=True),
+                          date_x, y, date_width)
+    y = min(point_end, collected_end) - 2
+    address = info.get('address') or ''
+    y = _cell(pdf, _para('Адрес: ' + address, 10), M, y, WIDTH)
+    if pdf is not None and not address:
+        _rule(pdf, M + 35, y + 1, M + 240)
+    y -= 6
+    headings = ('№', 'Наименование', 'Кол-во', 'Цена', 'Скидка', 'Итого')
+    return y - _table_row(pdf, headings, M, y, True)
 
 
 def _invoice_end(pdf, top, r):
-    y = _cell(pdf, _para(f'Всего, шт.: {sum(v["qty"] for v in r["lines"])}     '
-                         f'Сумма товаров: {_amount(r["gross"])} ₸     Скидка: {_amount(r["discount"])} ₸', 9),
-              M, top-5, WIDTH)-3
-    y = _cell(pdf, _para(f'Итого к оплате: {_amount(r["paid"])} ₸', 12, True), M, y, WIDTH)-6
-    return _cell(pdf, _para('Курьер: _______________________________________', 9), M, y, WIDTH)
+    qty = sum(line['qty'] for line in r['lines'])
+    qty_end = _cell(pdf, _para(f'Всего, шт.: {qty}', 10, True), M, top - 5, 135)
+    totals = f'Сумма товаров: {_amount(r["gross"])} ₸     Скидка: {_amount(r["discount"])} ₸'
+    totals_end = _cell(pdf, _para(totals, 9.5, right=True), M + 145, top - 5, WIDTH - 145)
+    y = min(qty_end, totals_end) - 7
+    paid = f'Итого к оплате: {_amount(r["paid"])} ₸'
+    paid_end = _cell(pdf, _para(paid, 13, True, True), M + 225, y, WIDTH - 225)
+    courier_end = _cell(pdf, _para('Курьер:', 10), M, y - 6, 45)
+    if pdf is not None:
+        _rule(pdf, M + 45, courier_end + 1, M + 211)
+    return min(courier_end, paid_end)
 
 
 def _invoices_pdf(receipts, catalog, collected, delivery):
     out = BytesIO()
     pdf = Canvas(out, pagesize=A4)
     pdf.setTitle('Накладные по точкам')
-    dates = _dates(collected, delivery)
     half_height = H/2-M-9
     pending_half = False
     printed = False
@@ -411,13 +479,13 @@ def _invoices_pdf(receipts, catalog, collected, delivery):
             name = line['name'] + (' (ОБМЕН)' if line['exchange'] else '')
             values = (i, name, line['qty'], _amount(line['price']), _amount(line['discount']), _amount(line['total']))
             rows.append((values,_table_row(None,values,M,0)))
-        head_h = -_invoice_header(None,0,r,info,dates)
+        head_h = -_invoice_header(None, 0, r, info, collected, delivery)
         tail_h = -_invoice_end(None,0,r)
         height = head_h+sum(h for _,h in rows)+tail_h
         if height <= half_height + 0.001:
             if pending_half:
                 _rule(pdf, M, H/2, W-M, True)
-            y = _invoice_header(pdf, H/2-10 if pending_half else H-M,r,info,dates)
+            y = _invoice_header(pdf, H/2-10 if pending_half else H-M, r, info, collected, delivery)
             for values, h in rows:
                 _table_row(pdf,values,M,y)
                 y -= h
@@ -430,21 +498,21 @@ def _invoices_pdf(receipts, catalog, collected, delivery):
             pdf.showPage()
             pending_half = False
         part = 0
-        y = _invoice_header(pdf,H-M,r,info,dates)
+        y = _invoice_header(pdf, H-M, r, info, collected, delivery)
         for i,(values,h) in enumerate(rows):
             reserved = tail_h if i == len(rows)-1 else 14
             if y-h-reserved < M:
                 _cell(pdf,_para(f'Продолжение накладной № {r["id"]} на следующем листе', 8, color=MUTED),M,M+8,WIDTH)
                 pdf.showPage()
                 part += 1
-                y = _invoice_header(pdf,H-M,r,info,dates,part)
+                y = _invoice_header(pdf, H-M, r, info, collected, delivery, part)
             _table_row(pdf,values,M,y)
             y -= h
         _invoice_end(pdf,y,r)
         pdf.showPage()
     if not printed:
         y = _cell(pdf,_para('Накладные по точкам', 20, True), M,H-M,WIDTH)
-        y = _cell(pdf,_para(dates,10),M,y-9,WIDTH)
+        y = _cell(pdf,_para(_dates(collected, delivery),10),M,y-9,WIDTH)
         _cell(pdf,_para('Все точки в этой выгрузке исключены из накладных.', 11),M,y-20,WIDTH)
     pdf.save()
     return out.getvalue()
