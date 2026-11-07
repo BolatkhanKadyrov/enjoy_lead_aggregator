@@ -120,10 +120,11 @@ def question_for(receipts, catalog):
 
 
 class Bot:
-    def __init__(self, store, token, admin_ids, public_url, *, limits=None):
+    def __init__(self, store, token, admin_ids, public_url, *, limits=None, operator_ids=()):
         self.store = store
         self.api = Telegram(token)
         self.admin_ids = set(admin_ids)
+        self.operator_ids = set(operator_ids)
         self.limits = limits if limits is not None else IntakeLimits()
         self.connected = False
         public_url = public_url or ""
@@ -187,6 +188,10 @@ class Bot:
         uid = sender.get("id")
         if not uid or sender.get("is_bot") or chat.get("type") != "private" or chat.get("id") != uid:
             return
+        if self.operator_ids and uid not in self.operator_ids and uid not in self.admin_ids:
+            if not callback:
+                self.refuse(uid, message, "Доступ к боту ограничен. Обратитесь к администратору цеха.")
+            return
 
         if callback:
             self.on_callback(uid, callback, message)
@@ -207,7 +212,7 @@ class Bot:
                 "text": "Настройки цеха", "web_app": {"url": self.public_url}
             }]]}
         self.say(uid, f"Отправьте полную выгрузку за день одним файлом .xlsx. "
-                 f"Принимаю файлы по будням с {hours['start']} до {hours['end']} по времени Астаны. "
+                 f"Принимаю файлы каждый день с {hours['start']} до {hours['end']} по времени Астаны. "
                  "В ответ вы получите план производства и накладные.", markup)
 
     def refuse(self, uid, message, reason):
@@ -248,17 +253,12 @@ class Bot:
         sent = datetime.fromtimestamp(message["date"], ZONE)
         hours = self.store.settings()
         clock = sent.strftime("%H:%M")
-        weekend = sent.weekday() >= 5
-        if weekend or not hours["start"] <= clock <= hours["end"]:
+        if not hours["start"] <= clock <= hours["end"]:
             opening = sent.date()
-            if weekend or clock > hours["end"]:
-                opening = next_delivery(opening)
-            if weekend:
-                day_name = "суббота" if sent.weekday() == 5 else "воскресенье"
-                reason = f"Это {day_name}, приём файлов закрыт на выходные."
-            else:
-                reason = f"В будни приём открыт с {hours['start']} до {hours['end']}."
-            self.refuse(uid, message, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. {reason}\n"
+            if clock > hours["end"]:
+                opening += timedelta(days=1)
+            self.refuse(uid, message, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. "
+                        f"Приём открыт ежедневно с {hours['start']} до {hours['end']}.\n"
                         f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
                         "Отправьте Excel ещё раз в часы приёма.")
             return

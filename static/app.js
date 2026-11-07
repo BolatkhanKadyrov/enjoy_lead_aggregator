@@ -325,7 +325,7 @@ function sectionForm() {
 }
 
 function hoursForm() {
-  const form = makeForm("Приём файлов", "По будням, по времени Астаны. Бот проверяет время отправки Excel в Telegram.", false);
+  const form = makeForm("Приём файлов", "Каждый день по времени Астаны. Бот проверяет время отправки Excel в Telegram.", false);
   const times = el("div", "times");
   const start = el("input", "input");
   const end = el("input", "input");

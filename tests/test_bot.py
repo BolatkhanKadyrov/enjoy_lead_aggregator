@@ -115,7 +115,7 @@ class BotTest(unittest.TestCase):
         self.bot.handle({"message": msg})
         self.assertEqual(len(self.tg.albums), 3, "replayed Telegram update must not send a second album")
 
-    def test_submission_hours_weekend_and_invalid_upload_preserve_latest(self):
+    def test_submission_hours_and_invalid_upload_preserve_latest(self):
         self.upload([receipt(3)], when="2026-10-08 17:59")
         self.upload([receipt(1)], when="2026-10-08 18:00:00")
         self.upload([receipt(2)], when="2026-10-08 23:30:59")
@@ -125,20 +125,23 @@ class BotTest(unittest.TestCase):
         self.parse.side_effect = ValueError("неверный заголовок")
         self.upload([receipt(99)], when="2026-10-09 17:16")
         self.assertIn("неверный заголовок", self.tg.messages[-1]["text"])
-        self.upload([receipt(3)], when="2026-10-10 19:00")
+        self.upload([receipt(3)], when="2026-10-10 19:01")
         self.assertEqual([r["id"] for r in self.store.get_job(100)["receipts"]], ["4"])
         self.assertEqual(len(self.tg.albums), 3)
 
-    def test_weekend_refusal_uses_telegram_timestamp_in_astana(self):
-        for utc, local_time in (("2026-11-06T19:15:00+00:00", "00:15"),
-                                ("2026-11-07T17:45:00+00:00", "22:45")):
-            with self.subTest(utc=utc):
-                message = self.message(date=int(datetime.fromisoformat(utc).timestamp()),
-                                       document={"file_id": "unused", "file_name": "day.xlsx"})
-                self.bot.handle({"message": message})
-                reply = self.tg.messages[-1]["text"].lower()
-                for detail in ("суббота", "07.11.2026", local_time, "09.11.2026 в 18:00"):
-                    self.assertIn(detail, reply)
+    def test_weekend_uploads_in_astana_produce_monday_delivery(self):
+        for day, time_in_utc in ((7, "2026-11-07T17:45:00+00:00"),
+                                 (8, "2026-11-08T18:30:59+00:00")):
+            with self.subTest(day=day):
+                self.upload([receipt(day)], date=int(datetime.fromisoformat(time_in_utc).timestamp()))
+                self.assertEqual(self.draw.call_args.args[2:], (date(2026,11,day), date(2026,11,9)))
+        self.assertEqual(len(self.tg.albums), 2)
+
+    def test_after_closing_next_intake_is_next_calendar_day(self):
+        for day, opening_day in ((6, 7), (7, 8), (8, 9)):
+            with self.subTest(day=day):
+                self.upload([receipt(day)], when=f"2026-11-{day:02d} 23:31")
+                self.assertIn(f"{opening_day:02d}.11.2026 в 18:00", self.tg.messages[-1]["text"])
         self.parse.assert_not_called()
 
     def test_weekday_refusal_reports_local_time_and_configured_hours(self):

@@ -454,7 +454,7 @@ def _invoice_header(pdf, top, r, info, collected, delivery, part=0):
 def _invoice_end(pdf, top, r):
     qty = sum(line['qty'] for line in r['lines'])
     qty_end = _cell(pdf, _para(f'Всего, шт.: {qty}', 10, True), M, top - 5, 135)
-    totals = f'Сумма товаров: {_amount(r["gross"])} ₸     Скидка: {_amount(r["discount"])} ₸'
+    totals = f'Сумма товаров: {_amount(r["gross"])} ₸  ·  Скидка: {_amount(r["discount"])} ₸'
     totals_end = _cell(pdf, _para(totals, 9.5, right=True), M + 145, top - 5, WIDTH - 145)
     y = min(qty_end, totals_end) - 7
     paid = f'Итого к оплате: {_amount(r["paid"])} ₸'

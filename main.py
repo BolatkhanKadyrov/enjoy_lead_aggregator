@@ -13,10 +13,10 @@ from store import IntakeLimits, Store
 from web import WebApp
 
 
-def admin_ids(value):
+def telegram_ids(value, name):
     parts = [v.strip() for v in value.replace("\n", ",").split(",") if v.strip()]
-    if any(not v.isascii() or not v.isdecimal() or int(v) <= 0 for v in parts):
-        raise ValueError("ADMIN_IDS должен содержать числовые ID личных чатов через запятую.")
+    if (value.strip() and not parts) or any(not v.isascii() or not v.isdecimal() or int(v) <= 0 for v in parts):
+        raise ValueError(f"{name} должен содержать числовые ID личных чатов через запятую.")
     return {int(v) for v in parts}
 
 
@@ -25,7 +25,8 @@ def main():
     token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Добавьте BOT_TOKEN в переменные окружения.")
-    ids = admin_ids(os.getenv("ADMIN_IDS", ""))
+    ids = telegram_ids(os.getenv("ADMIN_IDS", ""), "ADMIN_IDS")
+    operators = telegram_ids(os.getenv("OPERATOR_IDS", ""), "OPERATOR_IDS")
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
     public_url = os.getenv("PUBLIC_URL", "").strip() or ("https://" + domain if domain else "")
     if public_url:
@@ -50,12 +51,13 @@ def main():
         per_user=int(os.getenv("UPLOADS_PER_USER_PER_10_MINUTES", defaults.per_user)),
         global_rate=int(os.getenv("UPLOADS_PER_MINUTE_TOTAL", defaults.global_rate)),
     )
-    bot = Bot(store, token, ids, public_url, limits=limits)
+    bot = Bot(store, token, ids, public_url, limits=limits, operator_ids=operators)
     stop = threading.Event()
     worker = threading.Thread(target=bot.run, args=(stop,), name="telegram-poller", daemon=True)
     app = WebApp(store, token, ids, ready=lambda: worker.is_alive() and bot.connected)
     server = create_server(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")),
-                           threads=4, max_request_body_size=16384, clear_untrusted_proxy_headers=True)
+                           threads=4, max_request_body_size=16384, max_request_header_size=32768,
+                           clear_untrusted_proxy_headers=True)
     def shutdown(*_):
         stop.set()
         raise KeyboardInterrupt
