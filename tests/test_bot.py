@@ -112,6 +112,27 @@ class BotTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in self.store.get_job(100)["receipts"]], ["4"])
         self.assertEqual(len(self.tg.albums), 3)
 
+    def test_weekend_refusal_uses_telegram_timestamp_in_astana(self):
+        for utc, local_time in (("2026-11-07T17:45:00+00:00", "22:45"),
+                                ("2026-11-06T19:15:00+00:00", "00:15")):
+            with self.subTest(utc=utc):
+                message = self.message(date=int(datetime.fromisoformat(utc).timestamp()),
+                                       document={"file_id": "unused", "file_name": "day.xlsx"})
+                self.bot.handle({"message": message})
+                reply = self.tg.messages[-1]["text"].lower()
+                for detail in ("суббота", "07.11.2026", local_time, "09.11.2026 в 18:00"):
+                    self.assertIn(detail, reply)
+        self.parse.assert_not_called()
+
+    def test_weekday_refusal_reports_local_time_and_configured_hours(self):
+        self.store.set_settings("18:15", "22:50")
+        self.upload([receipt(4)], when="2026-11-09 17:59")
+        reply = self.tg.messages[-1]["text"].lower()
+        for detail in ("09.11.2026", "17:59", "18:15", "22:50"):
+            self.assertIn(detail, reply)
+        self.assertNotIn("выходной", reply)
+        self.parse.assert_not_called()
+
     def test_replies_stale_callbacks_and_new_section_survive_restart(self):
         self.upload([receipt(1, "Точка A", "Новое A")])
         old = self.tg.messages[-1]

@@ -212,9 +212,20 @@ class Bot:
             return
         sent = datetime.fromtimestamp(message["date"], ZONE)
         hours = self.store.settings()
-        if sent.weekday() >= 5 or not hours["start"] <= sent.strftime("%H:%M") <= hours["end"]:
-            self.say(uid, f"Файл отправлен вне времени приёма. Отправьте его по будням "
-                     f"с {hours['start']} до {hours['end']} по времени Астаны.")
+        clock = sent.strftime("%H:%M")
+        weekend = sent.weekday() >= 5
+        if weekend or not hours["start"] <= clock <= hours["end"]:
+            opening = sent.date()
+            if weekend or clock > hours["end"]:
+                opening = next_delivery(opening)
+            if weekend:
+                day_name = "суббота" if sent.weekday() == 5 else "воскресенье"
+                reason = f"Это {day_name}, приём файлов закрыт на выходные."
+            else:
+                reason = f"В будни приём открыт с {hours['start']} до {hours['end']}."
+            self.say(uid, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. {reason}\n"
+                     f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
+                     "Отправьте Excel ещё раз в часы приёма.")
             return
         document = message["document"]
         if not document.get("file_name", "").casefold().endswith(".xlsx"):
