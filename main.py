@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from waitress import create_server
 
 from bot import Bot
-from store import IntakeLimits, Store
+from store import IntakeLimits, Store, employee_id
 from web import WebApp
 
 
@@ -20,6 +20,15 @@ def telegram_ids(value, name):
     return {int(v) for v in parts}
 
 
+def owner_from_env(value):
+    if not value.strip():
+        return None
+    try:
+        return employee_id(value.strip())
+    except ValueError:
+        raise ValueError("OWNER_ID должен содержать один числовой ID вашего личного аккаунта Telegram.") from None
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     token = os.environ.get("BOT_TOKEN", "").strip()
@@ -27,6 +36,7 @@ def main():
         raise SystemExit("Добавьте BOT_TOKEN в переменные окружения.")
     ids = telegram_ids(os.getenv("ADMIN_IDS", ""), "ADMIN_IDS")
     operators = telegram_ids(os.getenv("OPERATOR_IDS", ""), "OPERATOR_IDS")
+    owner = owner_from_env(os.getenv("OWNER_ID", ""))
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
     public_url = os.getenv("PUBLIC_URL", "").strip() or ("https://" + domain if domain else "")
     if public_url:
@@ -45,16 +55,17 @@ def main():
         seed_value = seed_file.read_text(encoding="utf-8-sig")
     store = Store(data_dir / "enjoy.sqlite3", initial_catalog=json.loads(seed_value) if seed_value else None,
                   require_catalog=bool(os.getenv("RAILWAY_SERVICE_ID")))
+    store.seed_staff(owner, ids, operators)
     defaults = IntakeLimits()
     limits = IntakeLimits(
         cooldown=int(os.getenv("UPLOAD_COOLDOWN_SECONDS", defaults.cooldown)),
         per_user=int(os.getenv("UPLOADS_PER_USER_PER_10_MINUTES", defaults.per_user)),
         global_rate=int(os.getenv("UPLOADS_PER_MINUTE_TOTAL", defaults.global_rate)),
     )
-    bot = Bot(store, token, ids, public_url, limits=limits, operator_ids=operators)
+    bot = Bot(store, token, ids, public_url, limits=limits, operator_ids=operators, owner_id=owner)
     stop = threading.Event()
     worker = threading.Thread(target=bot.run, args=(stop,), name="telegram-poller", daemon=True)
-    app = WebApp(store, token, ids, ready=lambda: worker.is_alive() and bot.connected)
+    app = WebApp(store, token, ids, ready=lambda: worker.is_alive() and bot.connected, owner_id=owner)
     server = create_server(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")),
                            threads=4, max_request_body_size=16384, max_request_header_size=32768,
                            clear_untrusted_proxy_headers=True)

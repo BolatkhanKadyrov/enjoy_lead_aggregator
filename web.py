@@ -5,11 +5,12 @@ import hmac
 import json
 import logging
 import time
+from contextlib import nullcontext
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from store import Conflict
+from store import Conflict, PERMISSIONS, employee_id
 
 
 STATIC = Path(__file__).with_name("static")
@@ -46,10 +47,11 @@ def signed_user(header, token, now=None):
 
 
 class WebApp:
-    def __init__(self, store, token, admin_ids, ready=lambda: True):
+    def __init__(self, store, token, admin_ids, ready=lambda: True, *, owner_id=None):
         self.store = store
         self.token = token
         self.admin_ids = admin_ids
+        self.owner_id = owner_id
         self.ready = ready
 
     def __call__(self, env, start_response):
@@ -68,6 +70,8 @@ class WebApp:
                 status, body = self.api(env, path, method)
             else:
                 status, body = 404, {"error": "Страница не найдена."}
+        except PermissionError:
+            status, body = 403, {"error": "Для этого действия недостаточно прав. Обратитесь к владельцу цеха."}
         except Conflict as exc:
             status, body = 409, {"error": str(exc)}
         except (KeyError, TypeError, RecursionError):
@@ -86,14 +90,45 @@ class WebApp:
         ])
         return [b"" if method == "HEAD" else body]
 
+    def access(self, uid, required=()):
+        if self.owner_id is not None:
+            return self.store.authorized(uid, required, self.owner_id)
+        if uid not in self.admin_ids or "employees" in required:
+            raise PermissionError
+        return nullcontext(set(PERMISSIONS))
+
+    def visible_state(self, uid, grants):
+        if not grants:
+            raise PermissionError
+        catalog = self.store.state()
+        owner = uid == self.owner_id
+        result = {"owner": owner, "permissions": [p for p in PERMISSIONS if p in grants]}
+        point_fields = ["name"]
+        if "point_addresses" in grants:
+            point_fields.append("address")
+        if "invoice_exclusions" in grants:
+            point_fields.append("excluded")
+        if len(point_fields) > 1:
+            result["points"] = [{k: item[k] for k in point_fields} for item in catalog["points"]]
+        if grants.intersection(("dishes", "sections")):
+            result["sections"] = catalog["sections"]
+        if "dishes" in grants:
+            result["dishes"] = catalog["dishes"]
+        if "hours" in grants:
+            result["settings"] = catalog["settings"]
+        if owner:
+            result["employees"] = [p for p in self.store.staff_list() if p["id"] != str(uid)]
+        return result
+
     def api(self, env, path, method):
         user_id = signed_user(env.get("HTTP_AUTHORIZATION", ""), self.token)
         if user_id is None:
             return 401, {"error": "Сеанс истёк. Откройте настройки заново из бота."}
-        if user_id not in self.admin_ids:
-            return 403, {"error": "Настройки доступны только администраторам."}
+        if self.owner_id is None and user_id not in self.admin_ids:
+            raise PermissionError
         if path == "/api/state" and method == "GET":
-            return 200, self.store.state()
+            with self.access(user_id) as grants:
+                return 200, self.visible_state(user_id, grants)
         if method != "POST":
             return 405, {"error": "Метод не поддерживается."}
         if env.get("CONTENT_TYPE", "").split(";")[0].strip() != "application/json":
@@ -109,13 +144,30 @@ class WebApp:
             return 400, {"error": "Проверьте поля формы."}
         previous = data.get("previous")
         if path == "/api/point":
-            self.store.edit_point(data["name"], data["address"], data["excluded"], previous)
-        elif path == "/api/section":
-            self.store.add_section(data["name"])
-        elif path == "/api/dish":
-            self.store.move_dish(data["name"], data["section"], previous)
-        elif path == "/api/settings":
-            self.store.set_settings(data["start"], data["end"], previous)
+            point_rights = {"address": "point_addresses", "excluded": "invoice_exclusions"}
+            changes = {k: data[k] for k in point_rights if k in data}
+            if not changes or set(data) - {"name", "previous", *point_rights}:
+                return 400, {"error": "Проверьте изменённые поля точки."}
+            with self.access(user_id, [point_rights[k] for k in changes]):
+                self.store.edit_point_fields(data["name"], changes, previous)
+        elif path in ("/api/employee", "/api/employee/remove"):
+            with self.access(user_id, ("employees",)):
+                target = employee_id(data["id"])
+                if target == self.owner_id:
+                    return 400, {"error": "Владелец задаётся в Railway через OWNER_ID."}
+                if path == "/api/employee":
+                    self.store.save_employee(target, data["name"], data["permissions"], previous)
+                else:
+                    self.store.remove_employee(target, data["previous"])
         else:
-            return 404, {"error": "Операция не найдена."}
+            required = {"/api/section": "sections", "/api/dish": "dishes", "/api/settings": "hours"}.get(path)
+            if required is None:
+                return 404, {"error": "Операция не найдена."}
+            with self.access(user_id, (required,)):
+                if path == "/api/section":
+                    self.store.add_section(data["name"])
+                elif path == "/api/dish":
+                    self.store.move_dish(data["name"], data["section"], previous)
+                else:
+                    self.store.set_settings(data["start"], data["end"], previous)
         return 200, {"ok": True}

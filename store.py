@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,8 @@ class IntakeLimits:
 
 
 INTAKE_RETENTION = 48 * 3600
+PERMISSIONS = ("point_addresses", "invoice_exclusions", "dishes", "sections", "hours")
+MAX_TELEGRAM_ID = 2**52 - 1
 
 
 def clean(value, label, limit, *, empty=False):
@@ -48,6 +51,29 @@ def check_previous(previous, actual):
         raise Conflict("Запись уже изменена. Обновите данные и повторите сохранение.")
 
 
+def employee_id(value):
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,16}", value):
+        value = int(value)
+    if type(value) is not int or not 1 <= value <= MAX_TELEGRAM_ID:
+        raise ValueError("Введите числовой Telegram ID личного чата.")
+    return value
+
+
+def employee_fields(name, permissions):
+    name = clean(name, "Имя сотрудника", 100)
+    if (not isinstance(permissions, list) or len(permissions) > len(PERMISSIONS)
+            or any(not isinstance(p, str) or p not in PERMISSIONS for p in permissions)
+            or len(set(permissions)) != len(permissions)):
+        raise ValueError("Выберите права из списка.")
+    return {"name": name, "permissions": [p for p in PERMISSIONS if p in permissions]}
+
+
+def employee_snapshot(previous):
+    if not isinstance(previous, dict) or set(previous) != {"name", "permissions"}:
+        raise ValueError("Откройте актуальную карточку сотрудника.")
+    return employee_fields(previous["name"], previous["permissions"])
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sections (
     key TEXT PRIMARY KEY, name TEXT NOT NULL
@@ -59,9 +85,17 @@ CREATE TABLE IF NOT EXISTS points (
     key TEXT PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, excluded INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS employees (
+    user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, permissions TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
     user_id INTEGER PRIMARY KEY, version TEXT NOT NULL, receipts TEXT NOT NULL,
     collected TEXT NOT NULL, status TEXT NOT NULL, pending TEXT
+);
+CREATE TABLE IF NOT EXISTS job_answers (
+    user_id INTEGER NOT NULL REFERENCES jobs(user_id) ON DELETE CASCADE, version TEXT NOT NULL,
+    kind TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, answer TEXT NOT NULL,
+    PRIMARY KEY(user_id,kind,key)
 );
 CREATE TABLE IF NOT EXISTS intake (
     user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, sent_at INTEGER NOT NULL,
@@ -90,6 +124,8 @@ CREATE INDEX IF NOT EXISTS album_notices_age ON intake_album_notices(notified_at
 class Store:
     def __init__(self, database, *, initial_catalog=None, require_catalog=False):
         self.database = Path(database)
+        self._bound_connection = ContextVar("staff_transaction", default=None)
+        self._owner_id = None
         self.database.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -123,6 +159,10 @@ class Store:
 
     @contextmanager
     def connection(self, *, write=False):
+        bound = self._bound_connection.get()
+        if bound is not None:
+            yield bound
+            return
         conn = sqlite3.connect(self.database, timeout=12)
         conn.row_factory = sqlite3.Row
         try:
@@ -133,6 +173,87 @@ class Store:
                 yield conn
         finally:
             conn.close()
+
+    def seed_staff(self, owner_id, admin_ids, operator_ids):
+        """Import legacy environment grants once. Subsequent edits belong to the owner."""
+        with self.connection(write=True) as conn:
+            seeded = conn.execute("SELECT 1 FROM config WHERE key='staff_seeded'").fetchone()
+            if owner_id is None:
+                if seeded:
+                    raise ValueError("Для управления сотрудниками укажите OWNER_ID в переменных окружения.")
+                return
+            owner = employee_id(owner_id)
+            if not seeded:
+                admins = {employee_id(uid) for uid in admin_ids}
+                operators = {employee_id(uid) for uid in operator_ids}
+                for uid in sorted((admins | operators) - {owner}):
+                    grants = PERMISSIONS if uid in admins else ()
+                    conn.execute("INSERT OR IGNORE INTO employees VALUES (?,?,?)",
+                                 (uid, f"Telegram {uid}", json.dumps(grants)))
+                conn.execute("INSERT INTO config VALUES ('staff_seeded','1')")
+            # If ownership was transferred to an existing employee, only OWNER_ID
+            # now grants this account access. It cannot be edited as an employee.
+            conn.execute("DELETE FROM employees WHERE user_id=?", (owner,))
+        self._owner_id = owner
+
+    def staff_permissions(self, uid):
+        with self.connection() as conn:
+            row = conn.execute("SELECT permissions FROM employees WHERE user_id=?", (uid,)).fetchone()
+            return None if row is None else set(json.loads(row[0]))
+
+    def staff_list(self):
+        with self.connection() as conn:
+            return [{"id": str(row["user_id"]), "name": row["name"], "permissions": json.loads(row["permissions"])}
+                    for row in conn.execute("SELECT user_id,name,permissions FROM employees ORDER BY name,user_id")]
+
+    @contextmanager
+    def authorized(self, uid, required, owner_id):
+        """Serialize grant checks and the protected operation with concurrent revocations."""
+        required = {required} if isinstance(required, str) else set(required)
+        with self.connection(write=True) as conn:
+            token = self._bound_connection.set(conn)
+            try:
+                if owner_id is not None and uid == owner_id:
+                    available = set(PERMISSIONS) | {"employees"}
+                else:
+                    available = self.staff_permissions(uid)
+                if available is None or not required <= available:
+                    raise PermissionError("Для этого действия у вас нет прав.")
+                yield available
+            finally:
+                self._bound_connection.reset(token)
+
+    def _editable_employee(self, empid):
+        uid = employee_id(empid)
+        if uid == self._owner_id:
+            raise ValueError("Владелец задаётся через OWNER_ID.")
+        return uid
+
+    def save_employee(self, empid, name, permissions, previous=None):
+        uid = self._editable_employee(empid)
+        fields = employee_fields(name, permissions)
+        encoded = json.dumps(fields["permissions"])
+        with self.connection(write=True) as conn:
+            row = conn.execute("SELECT name,permissions FROM employees WHERE user_id=?", (uid,)).fetchone()
+            if previous is None:
+                if row is not None:
+                    raise Conflict("Сотрудник с этим Telegram ID уже существует.")
+                conn.execute("INSERT INTO employees VALUES (?,?,?)", (uid, fields["name"], encoded))
+                return
+            if row is None:
+                raise Conflict("Этот сотрудник уже удалён.")
+            check_previous(employee_snapshot(previous), {"name": row["name"], "permissions": json.loads(row["permissions"])})
+            conn.execute("UPDATE employees SET name=?,permissions=? WHERE user_id=?", (fields["name"], encoded, uid))
+
+    def remove_employee(self, empid, previous):
+        uid = self._editable_employee(empid)
+        expected = employee_snapshot(previous)
+        with self.connection(write=True) as conn:
+            row = conn.execute("SELECT name,permissions FROM employees WHERE user_id=?", (uid,)).fetchone()
+            if row is None:
+                raise Conflict("Этот сотрудник уже удалён.")
+            check_previous(expected, {"name": row["name"], "permissions": json.loads(row["permissions"])})
+            conn.execute("DELETE FROM employees WHERE user_id=?", (uid,))
 
     @staticmethod
     def _insert_point(conn, point):
@@ -169,7 +290,8 @@ class Store:
 
     def state(self):
         with self.connection() as conn:
-            conn.execute("BEGIN")
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
             sections = [row[0] for row in conn.execute("SELECT name FROM sections ORDER BY rowid")]
             dishes = [dict(row) for row in conn.execute(
                 "SELECT dishes.name AS name, sections.name AS section FROM dishes "
@@ -210,16 +332,30 @@ class Store:
             )
 
     def edit_point(self, name, address, excluded, previous=None):
+        self.edit_point_fields(name, {"address": address, "excluded": excluded}, previous)
+
+    def edit_point_fields(self, name, changes, previous=None):
         point = key(clean(name, "Точка", 500))
-        address = clean(address, "Адрес", 500, empty=True)
-        if type(excluded) is not bool:
+        if not isinstance(changes, dict) or not changes or not changes.keys() <= {"address", "excluded"}:
+            raise ValueError("Проверьте поля точки.")
+        changes = changes.copy()
+        if "address" in changes:
+            changes["address"] = clean(changes["address"], "Адрес", 500, empty=True)
+        if "excluded" in changes and type(changes["excluded"]) is not bool:
             raise ValueError("Укажите, исключена ли точка из накладных.")
+        if previous is not None and (not isinstance(previous, dict) or previous.keys() != changes.keys()
+                                    or ("excluded" in previous and type(previous["excluded"]) is not bool)
+                                    or ("address" in previous and not isinstance(previous["address"], str))):
+            raise ValueError("Откройте актуальную карточку точки.")
         with self.connection(write=True) as conn:
             row = conn.execute("SELECT address,excluded FROM points WHERE key=?", (point,)).fetchone()
             if row is None:
                 raise ValueError("Точка отсутствует в справочнике.")
-            check_previous(previous, {"address": row["address"], "excluded": bool(row["excluded"])})
-            conn.execute("UPDATE points SET address=?,excluded=? WHERE key=?", (address, excluded, point))
+            actual = {"address": row["address"], "excluded": bool(row["excluded"])}
+            check_previous(previous, {field: actual[field] for field in changes})
+            actual.update(changes)
+            conn.execute("UPDATE points SET address=?,excluded=? WHERE key=?",
+                         (actual["address"], actual["excluded"], point))
 
     def move_dish(self, name, section, previous=None):
         dish = key(clean(name, "Блюдо", 500))
@@ -240,6 +376,34 @@ class Store:
                 "status='processing',pending=NULL",
                 (user_id, version, json.dumps(receipts, ensure_ascii=False), collected)
             )
+            conn.execute("DELETE FROM job_answers WHERE user_id=?", (user_id,))
+
+    def save_local_answer(self, uid, version, kind, name, value):
+        """Keep an answer with its private upload when shared editing is unavailable."""
+        if kind not in ("dish", "point"):
+            raise ValueError("Неизвестный тип ответа.")
+        name = clean(name, "Название", 500)
+        answer = (clean(value, "Раздел", 100) if kind == "dish"
+                  else clean(value, "Адрес", 500, empty=True))
+        with self.connection(write=True) as conn:
+            if not conn.execute("SELECT 1 FROM jobs WHERE user_id=? AND version=?", (uid, version)).fetchone():
+                return False
+            conn.execute("INSERT OR REPLACE INTO job_answers VALUES (?,?,?,?,?,?)",
+                         (uid, version, kind, key(name), name, answer))
+            return True
+
+    def job_overrides(self, uid, version):
+        result = {"dishes": {}, "points": {}}
+        with self.connection() as conn:
+            for row in conn.execute("SELECT kind,key,name,answer FROM job_answers WHERE user_id=? AND version=?",
+                                    (uid, version)):
+                if row["kind"] == "dish":
+                    result["dishes"][row["key"]] = row["answer"]
+                else:
+                    result["points"][row["key"]] = {
+                        "name": row["name"], "address": row["answer"], "excluded": False,
+                    }
+        return result
 
     def get_job(self, user_id):
         with self.connection() as conn:

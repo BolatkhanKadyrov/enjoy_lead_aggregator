@@ -67,6 +67,8 @@ h1 { font-size: 1.875rem; line-height: 1.17; letter-spacing: -.035em; overflow-w
 .filters select { max-width: 42%; }
 select, textarea, .input { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; min-height: 45px; padding: 10px 12px; }
 .listing { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.sections { margin: 0; padding: 0; list-style: none; }
+.sections .row { overflow-wrap: anywhere; }
 .row { width: 100%; display: flex; align-items: center; gap: 14px; border: 0; background: transparent; padding: 14px 17px; text-align: start; }
 .row + .row { border-top: 1px solid var(--line); }
 .row:first-child { border-start-start-radius: 11px; border-start-end-radius: 11px; }
@@ -81,13 +83,29 @@ select, textarea, .input { background: var(--surface); border: 1px solid var(--l
 .empty { padding: 22px 17px; }
 .button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; min-height: 44px; background: var(--surface); font-size: .9375rem; font-weight: 600; }
 .primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.danger { color: var(--danger); }
+.destructive { color: var(--canvas); background: var(--danger); border-color: var(--danger); }
 .back { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 4px 4px 4px 0; margin-bottom: 9px; color: var(--accent); background: transparent; border: 0; font-size: .9375rem; }
 .form-area { max-width: 590px; }
 .form-area .heading { margin-bottom: 22px; }
 .form-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 22px; display: grid; gap: 20px; }
 .field { display: grid; gap: 7px; min-width: 0; font-weight: 600; }
+.field .assist { font-weight: 400; }
 .field input, .field select, .field textarea { width: 100%; min-width: 0; font-weight: 400; }
 .field textarea { resize: vertical; min-height: 75px; }
+.field input[readonly] { color: var(--muted); background: var(--faint); }
+.grants { min-width: 0; border: 0; padding: 0; margin: 0; }
+.grants legend { font-weight: 650; margin-bottom: 5px; padding: 0; }
+.grant { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding-block: 8px; cursor: pointer; }
+.grant + .grant { border-top: 1px solid var(--line); }
+.switch { appearance: none; flex: 0 0 auto; display: grid; align-items: center; margin: 0; padding: 3px; width: 42px; height: 24px; border: 1px solid var(--muted); border-radius: 16px; background: var(--faint); cursor: pointer; }
+.switch::before { content: ""; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); }
+.switch:checked { background: var(--accent); border-color: var(--accent); }
+.switch:checked::before { justify-self: end; background: var(--on-accent); }
+@media (forced-colors: active) {
+  .switch { appearance: auto; }
+  .switch::before { display: none; }
+}
 .check { display: flex; align-items: center; gap: 11px; min-height: 44px; font-weight: 550; }
 .check input { margin: 0; width: 21px; height: 21px; }
 .form-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -111,8 +129,8 @@ button:active:not(:disabled) { filter: brightness(.94); }
   .brand { min-height: 58px; gap: 12px; }
   .brand-purpose { padding-inline-start: 12px; }
   .workspace { padding-top: 23px; }
-  .navigation { gap: 12px; justify-content: space-between; }
-  .navigation button { padding-inline: 4px; }
+  .navigation { gap: 4px 8px; flex-wrap: wrap; }
+  .navigation button { padding-inline: 3px; font-size: .875rem; }
   h1 { font-size: 1.55rem; }
   .heading { margin-bottom: 17px; }
   .filters { flex-direction: column; }

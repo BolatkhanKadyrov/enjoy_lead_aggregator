@@ -5,7 +5,14 @@ const screen = document.querySelector("#screen");
 const nav = document.querySelector("#nav-band");
 const notice = document.querySelector("#notice");
 const tabs = [...document.querySelectorAll("[data-view]")];
-const viewNames = {points: "Точки", dishes: "Блюда", hours: "Приём файлов"};
+const viewNames = {points: "Точки", dishes: "Блюда", hours: "Приём файлов", employees: "Сотрудники"};
+const permissionLabels = {
+  point_addresses: "Редактировать адреса точек",
+  invoice_exclusions: "Выбирать точки для печати накладных",
+  dishes: "Переносить блюда между разделами",
+  sections: "Создавать разделы плана",
+  hours: "Менять часы приёма файлов"
+};
 const filters = {points: {query: "", invoice: ""}, dishes: {query: "", section: ""}};
 const byName = new Intl.Collator("ru", {sensitivity: "base", numeric: true});
 let state;
@@ -48,6 +55,8 @@ function showNotice(message = "") {
 }
 
 function setAuthView(title, message, retry) {
+  state = null;
+  showNotice();
   editing = false;
   setNavigation(false);
   const panel = el("section", "access");
@@ -57,9 +66,26 @@ function setAuthView(title, message, retry) {
   screen.setAttribute("aria-busy", "false");
 }
 
+function can(key) {
+  return state?.owner === true || state?.permissions?.includes(key) === true;
+}
+
+function canOpen(name) {
+  if (name === "points") return can("point_addresses") || can("invoice_exclusions");
+  if (name === "dishes") return can("dishes") || can("sections");
+  if (name === "employees") return state?.owner === true;
+  return name === "hours" && can("hours");
+}
+
+function viewTitle(name) {
+  return name === "dishes" && !can("dishes") ? "Разделы" : viewNames[name];
+}
+
 function setNavigation(visible) {
   nav.hidden = !visible;
   for (const tab of tabs) {
+    tab.hidden = !canOpen(tab.dataset.view);
+    tab.textContent = viewTitle(tab.dataset.view);
     if (tab.dataset.view === view) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
   }
@@ -102,7 +128,7 @@ function authError(error) {
     return true;
   }
   if (error.status === 403) {
-    setAuthView("Доступ для администраторов", "Для этого аккаунта управление справочниками недоступно.");
+    setAuthView("Нет доступа к настройкам", "Попросите владельца назначить вам права в разделе «Сотрудники».", true);
     return true;
   }
   return false;
@@ -117,6 +143,11 @@ async function load(message = "") {
   screen.replaceChildren(el("h1", "", "Загружаем справочники…"));
   try {
     state = await api("state");
+    if (!canOpen(view)) view = tabs.find(tab => canOpen(tab.dataset.view))?.dataset.view;
+    if (!view) {
+      authError(new ApiError("", 403));
+      return;
+    }
     showView();
   } catch (err) {
     if (!authError(err)) setAuthView("Не удалось открыть справочники", err.message, true);
@@ -138,6 +169,8 @@ function showView() {
   editing = false;
   setNavigation(true);
   if (view === "hours") hoursForm();
+  else if (view === "employees") employeesView();
+  else if (view === "dishes" && !can("dishes")) sectionsView();
   else listView();
 }
 
@@ -158,13 +191,13 @@ function listView() {
   const saved = filters[view];
   const items = [...state[view]].sort((a, b) => byName.compare(a.name, b.name));
   const heading = makeHeading(viewNames[view], items.length);
-  if (!isPoint) heading.append(button("Новый раздел", "button", sectionForm, "plus"));
+  if (!isPoint && can("sections")) heading.append(button("Новый раздел", "button", sectionForm, "plus"));
 
   const controls = el("div", "filters");
   const searchLabel = el("label", "search");
   const search = el("input");
   search.type = "search";
-  search.placeholder = isPoint ? "Поиск по названию или адресу" : "Поиск блюда";
+  search.placeholder = !isPoint ? "Поиск блюда" : can("point_addresses") ? "Поиск по названию или адресу" : "Поиск по названию точки";
   search.setAttribute("aria-label", search.placeholder);
   search.value = saved.query;
   searchLabel.append(icon("search"), search);
@@ -173,7 +206,9 @@ function listView() {
     : [["", "Все разделы"], ...state.sections.map(section => [section, section])];
   const filterKey = isPoint ? "invoice" : "section";
   const filter = selectBox(isPoint ? "Печать накладных" : "Фильтр по разделу", options, saved[filterKey]);
-  controls.append(searchLabel, filter);
+  controls.append(searchLabel);
+  if (!isPoint || can("invoice_exclusions")) controls.append(filter);
+  else filter.value = "";
   const listing = el("div", "listing");
   const count = heading.querySelector(".count");
   count.setAttribute("aria-live", "polite");
@@ -183,7 +218,7 @@ function listView() {
     saved[filterKey] = filter.value;
     const query = search.value.trim().toLocaleLowerCase("ru");
     const matched = items.filter(item => {
-      const text = (item.name + " " + (isPoint ? item.address : item.section)).toLocaleLowerCase("ru");
+      const text = (item.name + " " + (isPoint ? (item.address || "") : item.section)).toLocaleLowerCase("ru");
       const group = isPoint ? (item.excluded ? "excluded" : "included") : item.section;
       return text.includes(query) && (!filter.value || group === filter.value);
     });
@@ -198,9 +233,10 @@ function listView() {
     for (const item of matched) {
       const row = button("", "row", () => isPoint ? pointForm(item) : dishForm(item));
       const text = el("span", "row-text");
-      text.append(el("span", "row-name", item.name), el("span", "row-meta", isPoint ? (item.address || "Адрес не указан") : item.section));
+      text.append(el("span", "row-name", item.name));
+      if (!isPoint || can("point_addresses")) text.append(el("span", "row-meta", isPoint ? (item.address || "Адрес не указан") : item.section));
       row.append(text);
-      if (isPoint && item.excluded) row.append(el("span", "flag", "Без накладной"));
+      if (isPoint && can("invoice_exclusions") && item.excluded) row.append(el("span", "flag", "Без накладной"));
       row.append(icon("next"));
       listing.append(row);
     }
@@ -234,7 +270,7 @@ function makeForm(title, context, isDetail) {
   const page = el("div", "form-area");
   if (isDetail) {
     showNotice();
-    page.append(button(viewNames[view], "back", leaveForm, "back"));
+    page.append(button(viewTitle(view), "back", leaveForm, "back"));
   }
   page.append(makeHeading(title));
   if (context) page.append(el("p", "context", context));
@@ -262,9 +298,14 @@ function submit(form, endpoint, payload, success, label = "Сохранить") 
   form.addEventListener("submit", async event => {
     event.preventDefault();
     if (busy || !form.reportValidity()) return;
+    const values = payload();
+    if (values === null) {
+      leaveForm();
+      showNotice("Изменений нет.");
+      return;
+    }
     busy = true;
     alert.hidden = true;
-    const values = payload();
     const fields = [...form.elements, ...tabs];
     fields.forEach(item => { item.disabled = true; });
     save.textContent = "Сохраняем…";
@@ -272,6 +313,10 @@ function submit(form, endpoint, payload, success, label = "Сохранить") 
       await api(endpoint, values);
       await load(success);
     } catch (error) {
+      if (error.status === 403) {
+        await load("Ваши права доступа изменились.");
+        return;
+      }
       if (authError(error)) return;
       alert.textContent = error.message;
       alert.hidden = false;
@@ -298,11 +343,21 @@ function pointForm(point) {
   print.checked = !point.excluded;
   const check = el("label", "check");
   check.append(print, "Печатать накладную для этой точки");
-  form.append(field("Адрес", address), check);
-  submit(form, "point", () => ({
-    name: point.name, address: address.value.trim(), excluded: !print.checked,
-    previous: {address: point.address, excluded: point.excluded}
-  }), "Настройки точки сохранены.");
+  if (can("point_addresses")) form.append(field("Адрес", address));
+  if (can("invoice_exclusions")) form.append(check);
+  submit(form, "point", () => {
+    const changes = {};
+    const previous = {};
+    if (can("point_addresses") && point.address !== address.value.trim()) {
+      changes.address = address.value.trim();
+      previous.address = point.address;
+    }
+    if (can("invoice_exclusions") && point.excluded !== !print.checked) {
+      changes.excluded = !print.checked;
+      previous.excluded = point.excluded;
+    }
+    return Object.keys(changes).length ? {name: point.name, ...changes, previous} : null;
+  }, "Настройки точки сохранены.");
 }
 
 function dishForm(dish) {
@@ -324,6 +379,87 @@ function sectionForm() {
   submit(form, "section", () => ({name: name.value.trim()}), "Раздел сохранён.", "Сохранить раздел");
 }
 
+function sectionsView() {
+  const names = [...state.sections].sort(byName.compare);
+  const heading = makeHeading("Разделы", names.length);
+  heading.append(button("Новый раздел", "button", sectionForm, "plus"));
+  const listing = el("ul", "listing sections");
+  for (const name of names) listing.append(el("li", "row", name));
+  if (!names.length) listing.append(el("li", "empty", "Разделов пока нет."));
+  screen.replaceChildren(heading, listing);
+}
+
+function employeesView() {
+  const employees = [...state.employees].sort((a, b) => byName.compare(a.name, b.name));
+  const heading = makeHeading("Сотрудники", employees.length);
+  heading.append(button("Добавить сотрудника", "button", () => employeeForm(), "plus"));
+  const listing = el("div", "listing");
+  for (const employee of employees) {
+    const row = button("", "row", () => employeeForm(employee));
+    const text = el("span", "row-text");
+    text.append(el("span", "row-name", employee.name), el("span", "row-meta", "Telegram ID " + employee.id));
+    row.append(text, icon("next"));
+    listing.append(row);
+  }
+  if (!employees.length) listing.append(el("p", "empty", "Сотрудников пока нет."));
+  screen.replaceChildren(heading, listing);
+}
+
+function employeeForm(employee = null) {
+  const form = makeForm(employee ? employee.name : "Новый сотрудник", "", true);
+  const id = el("input", "input");
+  id.inputMode = "numeric";
+  id.pattern = "[1-9][0-9]{0,15}";
+  id.title = "Введите числовой Telegram ID сотрудника";
+  id.maxLength = 16;
+  id.required = true;
+  id.value = employee?.id || "";
+  id.readOnly = !!employee;
+  const name = el("input", "input");
+  name.maxLength = 100;
+  name.required = true;
+  name.value = employee?.name || "";
+  name.addEventListener("input", () => name.setCustomValidity(name.value.trim() ? "" : "Введите имя сотрудника."));
+  const idField = field("Telegram ID", id);
+  if (!employee) {
+    const hint = el("span", "assist", "Сотрудник может узнать свой ID командой /id в личном чате с ботом.");
+    hint.id = "employee-id-help";
+    id.setAttribute("aria-describedby", hint.id);
+    idField.append(hint);
+  }
+  form.append(idField, field("Имя сотрудника", name));
+
+  const grants = el("fieldset", "grants");
+  grants.append(el("legend", "", "Права на редактирование"));
+  for (const [key, title] of Object.entries(permissionLabels)) {
+    const label = el("label", "grant");
+    const toggle = el("input", "switch");
+    toggle.type = "checkbox";
+    toggle.name = "permission";
+    toggle.value = key;
+    toggle.setAttribute("role", "switch");
+    toggle.checked = employee?.permissions.includes(key) || false;
+    label.append(el("span", "", title), toggle);
+    grants.append(label);
+  }
+  form.append(grants);
+  const previous = employee ? {name: employee.name, permissions: employee.permissions} : null;
+  submit(form, "employee", () => ({
+    id: id.value, name: name.value.trim(),
+    permissions: [...grants.querySelectorAll("input:checked")].map(toggle => toggle.value),
+    previous
+  }), employee ? "Права сотрудника сохранены." : "Сотрудник добавлен.", employee ? "Сохранить" : "Добавить сотрудника");
+  if (employee) {
+    form.querySelector(".form-actions").append(button("Удалить сотрудника", "button danger", () => {
+      const confirmation = makeForm("Удалить сотрудника?", employee.name + " потеряет назначенные права на редактирование.", true);
+      submit(confirmation, "employee/remove", () => ({id: employee.id, previous}), "Сотрудник удалён.", "Да, удалить");
+      const actions = confirmation.querySelector(".form-actions");
+      actions.firstElementChild.classList.add("destructive");
+      actions.prepend(button("Отмена", "button", () => employeeForm(employee)));
+    }));
+  }
+}
+
 function hoursForm() {
   const form = makeForm("Приём файлов", "Каждый день по времени Астаны. Бот проверяет время отправки Excel в Telegram.", false);
   const times = el("div", "times");
@@ -341,7 +477,7 @@ function hoursForm() {
 
 for (const tab of tabs) {
   tab.addEventListener("click", () => {
-    if (busy) return;
+    if (busy || !canOpen(tab.dataset.view)) return;
     view = tab.dataset.view;
     showNotice();
     showView();
@@ -360,5 +496,5 @@ if (tg?.initData) {
   tg.expand?.();
   load();
 } else {
-  setAuthView("Откройте приложение в Telegram", "Отправьте боту /admin в личном чате и нажмите «Настройки цеха». Эта кнопка доступна назначенным администраторам.");
+  setAuthView("Откройте приложение в Telegram", "Отправьте боту /admin в личном чате и нажмите «Настройки цеха».");
 }

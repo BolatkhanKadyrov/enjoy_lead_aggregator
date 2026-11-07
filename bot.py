@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from documents import MAX_BYTES as MAX_XLSX_BYTES, parse_workbook, render_documents
-from store import IntakeLimits, key
+from store import PERMISSIONS, IntakeLimits, key
 
 
 LOG = logging.getLogger(__name__)
@@ -120,16 +120,24 @@ def question_for(receipts, catalog):
 
 
 class Bot:
-    def __init__(self, store, token, admin_ids, public_url, *, limits=None, operator_ids=()):
+    def __init__(self, store, token, admin_ids, public_url, *, limits=None, operator_ids=(), owner_id=None):
         self.store = store
         self.api = Telegram(token)
         self.admin_ids = set(admin_ids)
         self.operator_ids = set(operator_ids)
+        self.owner_id = owner_id
         self.limits = limits if limits is not None else IntakeLimits()
         self.connected = False
         public_url = public_url or ""
         parsed = urlsplit(public_url)
         self.public_url = public_url if parsed.scheme == "https" and parsed.hostname else None
+
+    def permissions(self, uid):
+        if self.owner_id is not None:
+            return PERMISSIONS if uid == self.owner_id else self.store.staff_permissions(uid)
+        if uid in self.admin_ids:
+            return PERMISSIONS
+        return () if uid in self.operator_ids else None
 
     def say(self, uid, text, markup=None):
         data = {"chat_id": uid, "text": text}
@@ -188,26 +196,38 @@ class Bot:
         uid = sender.get("id")
         if not uid or sender.get("is_bot") or chat.get("type") != "private" or chat.get("id") != uid:
             return
-        if self.operator_ids and uid not in self.operator_ids and uid not in self.admin_ids:
+        words = message.get("text", "").split(maxsplit=1)
+        command = words[0].partition("@")[0].lower() if words else ""
+        if self.operator_ids and self.permissions(uid) is None:
             if not callback:
-                self.refuse(uid, message, "Доступ к боту ограничен. Обратитесь к администратору цеха.")
+                reason = str(uid) if command == "/id" else (
+                    f"Доступ к боту ограничен. Передайте владельцу бота ваш Telegram ID: {uid}"
+                )
+                self.refuse(uid, message, reason)
             return
 
         if callback:
             self.on_callback(uid, callback, message)
+        elif command == "/id":
+            self.say(uid, str(uid))
         elif message.get("media_group_id"):
             self.refuse(uid, message, "Файлы отправлены альбомом. Отправьте одну полную выгрузку XLSX отдельным сообщением.")
         elif "document" in message:
             self.upload(uid, message)
         elif "text" in message:
-            self.on_text(uid, message)
+            self.on_text(uid, message, command)
         else:
             self.refuse(uid, message, "Отправьте выгрузку Excel в формате .xlsx как файл.")
 
-    def welcome(self, uid):
+    def welcome(self, uid, *, settings_requested=False):
+        grants = self.permissions(uid)
+        if settings_requested and self.owner_id is not None and not grants:
+            self.say(uid, "Чтобы открыть настройки, попросите владельца выдать вам права на редактирование. "
+                          f"Ваш Telegram ID: {uid}")
+            return
         hours = self.store.settings()
         markup = None
-        if uid in self.admin_ids and self.public_url:
+        if self.public_url and grants:
             markup = {"inline_keyboard": [[{
                 "text": "Настройки цеха", "web_app": {"url": self.public_url}
             }]]}
@@ -286,11 +306,10 @@ class Bot:
         self.store.record_work_error(uid, message["message_id"], failure)
         self.refuse(uid, message, failure)
 
-    def on_text(self, uid, message):
+    def on_text(self, uid, message, command):
         text = message["text"].strip()
-        command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
         if command in ("/start", "/help", "/admin"):
-            self.welcome(uid)
+            self.welcome(uid, settings_requested=command == "/admin")
             return
         if command == "/resume":
             version = self.store.job_version(uid)
@@ -362,16 +381,36 @@ class Bot:
         if not skip and (not text or len(text) > limit or any(ord(c) < 32 for c in text)):
             self.say(uid, f"Введите ответ длиной от 1 до {limit} символов.")
             return
+        if is_dish:
+            section_key = key(text)
+            text = next((option for option in prompt["options"] if key(option) == section_key), text)
         try:
-            if is_dish:
-                self.store.save_new_dish(prompt["name"], text)
-            else:
-                self.store.save_new_point(prompt["name"], text)
+            self.save_answer(uid, job["version"], prompt["kind"], prompt["name"], text)
         except ValueError:
             self.say(uid, "Не удалось сохранить значение. Проверьте текст и ответьте ещё раз.")
             return
         self.store.update_job(uid, job["version"], "processing")
         self.advance(uid, self.store.get_job(uid))
+
+    def save_answer(self, uid, version, kind, name, value):
+        is_dish = kind == "dish"
+        save_shared = self.store.save_new_dish if is_dish else self.store.save_new_point
+        if self.owner_id is None:
+            save_shared(name, value)
+            return
+        required = "dishes" if is_dish else "point_addresses"
+        try:
+            with self.store.authorized(uid, required, self.owner_id) as grants:
+                if version != self.store.job_version(uid):
+                    return
+                if is_dish and "sections" not in grants:
+                    sections = self.store.catalog()["sections"]
+                    if not any(key(section) == key(value) for section in sections):
+                        self.store.save_local_answer(uid, version, kind, name, value)
+                        return
+                save_shared(name, value)
+        except PermissionError:
+            self.store.save_local_answer(uid, version, kind, name, value)
 
     def prompt(self, uid, job, pending):
         pending = {**pending, "token": token_hex(8), "message_id": None}
@@ -393,6 +432,13 @@ class Bot:
                 nav.append({"text": "Дальше ›", "callback_data": prefix + f"p{pending.get('page', 0) + 1}"})
             if nav:
                 buttons.append(nav)
+        if self.owner_id is not None:
+            grants = self.permissions(uid) or ()
+            required = "dishes" if pending["kind"] == "dish" else "point_addresses"
+            if required not in grants:
+                text += "\nОтвет сохранится только для этой выгрузки."
+            elif pending["kind"] == "dish" and "sections" not in grants:
+                text += "\nНовый раздел можно указать только для этой выгрузки."
         sent = self.say(uid, text, {"inline_keyboard": buttons} if buttons else None)
         pending["message_id"] = sent["message_id"]
         self.store.update_job(uid, job["version"], "question", pending)
@@ -404,6 +450,16 @@ class Bot:
             self.say(uid, "Если оба PDF не пришли, введите /resume для повторной отправки.")
             return
         catalog = self.store.catalog()
+        overrides = self.store.job_overrides(uid, job["version"])
+        sections = {key(section): section for section in catalog["sections"]}
+        for dish, section in overrides["dishes"].items():
+            if dish not in catalog["dishes"]:
+                catalog["dishes"][dish] = sections.setdefault(key(section), section)
+        catalog["sections"] = list(sections.values())
+        for point, record in overrides["points"].items():
+            destination = catalog["points"].setdefault(point, record)
+            if not destination["address"]:
+                destination["address"] = record["address"]
         question = question_for(job["receipts"], catalog)
         if question:
             old = job.get("pending")
