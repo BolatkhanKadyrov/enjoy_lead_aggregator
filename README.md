@@ -15,6 +15,12 @@ Telegram-бот принимает одну полную выгрузку чек
 
 [Постоянный том Railway](https://docs.railway.com/volumes) · [Публичный домен Railway](https://docs.railway.com/networking/public-networking)
 
+### Изменение настроек production
+
+Настройки сборки, проверки `/health` и перезапуска заданы в [конфигурации Railway](.railway/railway.ts). Изменения кода в ветке `main` запускают обычный деплой из GitHub. Чтобы изменить саму конфигурацию инфраструктуры, привяжите Railway CLI к сервису `enjoy_lead_aggregator` в окружении `production` проекта `vigilant-quietude`. В корне репозитория выполните `npm ci` (Node.js 22.6+), затем `railway config plan --verbose`. Сверьте план и примените его командой `railway config apply`.
+
+Значения переменных хранятся в Railway. При добавлении переменной сервиса в Railway укажите её имя с `preserve()` в конфигурации перед следующим применением IaC. Для отдельного проекта сверьте имена ресурсов, домен и параметры тома с его собственным окружением. [Работа с Railway IaC](https://docs.railway.com/infrastructure-as-code)
+
 ## Работа в Telegram
 
 В личном чате введите `/` для списка команд с подсказками. `/help` показывает справку с учётом ваших прав, в том числе посреди оформления заказа. С помощью `/start` можно посмотреть часы приёма, `/resume` продолжает последнюю выгрузку, `/id` показывает ваш Telegram ID, а `/admin` открывает доступные настройки. Бот регистрирует меню команд автоматически. [Меню команд Telegram](https://core.telegram.org/bots/api#setmycommands)
