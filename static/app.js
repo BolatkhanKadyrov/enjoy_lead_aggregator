@@ -5,7 +5,7 @@ const screen = document.querySelector("#screen");
 const nav = document.querySelector("#nav-band");
 const notice = document.querySelector("#notice");
 const tabs = [...document.querySelectorAll("[data-view]")];
-const viewNames = {points: "Точки", dishes: "Блюда", hours: "Приём файлов", employees: "Сотрудники"};
+const viewNames = {points: "Точки", dishes: "Блюда", hours: "Приём файлов", employees: "Сотрудники", usage: "Статистика"};
 const permissionLabels = {
   point_addresses: "Редактировать адреса точек",
   invoice_exclusions: "Выбирать точки для печати накладных",
@@ -19,6 +19,7 @@ let state;
 let view = "points";
 let editing = false;
 let busy = false;
+let usageDays = "7";
 
 function el(tag, className, value) {
   const node = document.createElement(tag);
@@ -73,7 +74,7 @@ function can(key) {
 function canOpen(name) {
   if (name === "points") return can("point_addresses") || can("invoice_exclusions");
   if (name === "dishes") return can("dishes") || can("sections");
-  if (name === "employees") return state?.owner === true;
+  if (name === "employees" || name === "usage") return state?.owner === true;
   return name === "hours" && can("hours");
 }
 
@@ -170,6 +171,7 @@ function showView() {
   setNavigation(true);
   if (view === "hours") hoursForm();
   else if (view === "employees") employeesView();
+  else if (view === "usage") usageView();
   else if (view === "dishes" && !can("dishes")) sectionsView();
   else listView();
 }
@@ -458,6 +460,154 @@ function employeeForm(employee = null) {
       actions.prepend(button("Отмена", "button", () => employeeForm(employee)));
     }));
   }
+}
+
+const numberRu = new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 1});
+const usageDate = new Intl.DateTimeFormat("ru-RU", {
+  timeZone: "Asia/Almaty", day: "2-digit", month: "2-digit", year: "numeric",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+});
+const usagePeriods = [["1", "Сегодня"], ["7", "7 дней"], ["30", "30 дней"]];
+
+function fileSize(bytes) {
+  if (bytes === null) return "Неизвестен";
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let index = 0;
+  let value = bytes;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index++;
+  }
+  return numberRu.format(value) + " " + units[index];
+}
+
+function knownVolume(user, largest = false) {
+  if (!user.files && largest) return "—";
+  if (user.files && user.unknown_sizes === user.files) return "Неизвестен";
+  return (user.unknown_sizes ? "от " : "") + fileSize(largest ? user.max_bytes : user.total_bytes);
+}
+
+function usageFailure(target, error, retry) {
+  if (!target.isConnected || authError(error)) return;
+  const message = el("p", "feedback", error.message);
+  message.setAttribute("role", "alert");
+  target.replaceChildren(message, button("Повторить", "button", retry));
+}
+
+function usageMetric(label, value) {
+  const cell = el("span", "usage-metric");
+  cell.append(el("span", "usage-label", label), el("strong", "", value));
+  return cell;
+}
+
+async function usageView() {
+  const heading = makeHeading("Статистика");
+  const period = selectBox("Период статистики", usagePeriods, usageDays);
+  heading.append(period);
+  const content = el("div", "usage-content");
+  const loading = el("p", "assist", "Загружаем статистику…");
+  loading.setAttribute("role", "status");
+  content.append(loading);
+  screen.replaceChildren(heading, content);
+  period.addEventListener("change", () => {
+    usageDays = period.value;
+    usageView();
+    screen.querySelector("select").focus({preventScroll: true});
+  });
+  try {
+    const data = await api("usage?days=" + usageDays);
+    if (!content.isConnected) return;
+    const users = [...data.users].sort((a, b) => b.total_bytes - a.total_bytes ||
+      (b.files + b.resumes) - (a.files + a.resumes) || byName.compare(a.name, b.name));
+    const date = data.since.split("-").reverse().join(".");
+    const dates = el("p", "assist", "В запросы входят отправленные файлы и команды /resume. Период с " + date + " по времени Астаны. Учёт ведётся с " +
+      usageDate.format(data.started_at * 1000) + ".");
+    const listing = el("div", "listing usage-list");
+    if (!users.some(user => user.files || user.resumes)) {
+      listing.append(el("p", "empty", "За этот период файлы и команды /resume ещё не поступали."));
+    }
+    for (const user of users) {
+      const row = button("", "row usage-person", () => usageDetail(user));
+      const person = el("span", "row-text");
+      person.append(el("span", "row-name", user.name), el("span", "row-meta", "ID " + user.id));
+      row.append(person, usageMetric("Запросы", numberRu.format(user.files + user.resumes)),
+        usageMetric("Объём", knownVolume(user)), usageMetric("Макс. файл", knownVolume(user, true)), icon("next"));
+      listing.append(row);
+    }
+    content.replaceChildren(dates, listing);
+  } catch (error) {
+    usageFailure(content, error, usageView);
+  }
+}
+
+function usageDetail(user) {
+  editing = true;
+  setNavigation(false);
+  const page = el("section", "usage-detail");
+  const back = button("Статистика", "back", leaveForm, "back");
+  const period = usagePeriods.find(([days]) => days === usageDays)[1];
+  const heading = makeHeading(user.name);
+  page.append(back, heading, el("p", "context", "ID " + user.id + " · " + period + " · Время Астаны"));
+  const metrics = el("div", "usage-totals");
+  metrics.append(usageMetric("Файлы", numberRu.format(user.files)), usageMetric("Команды /resume", numberRu.format(user.resumes)),
+    usageMetric("Объём файлов", knownVolume(user)), usageMetric("Макс. файл", knownVolume(user, true)));
+  page.append(metrics);
+  const counts = ["Файлов принято " + numberRu.format(user.accepted), "отклонено " + numberRu.format(user.rejected)];
+  if (user.pending) counts.push("в обработке " + numberRu.format(user.pending));
+  page.append(el("p", "assist", counts.join(", ") + ". Чеков " + numberRu.format(user.receipts) +
+    ", товарных строк " + numberRu.format(user.lines) + "."));
+  if (user.unknown_sizes) page.append(el("p", "assist", "Файлов без данных о размере — " + numberRu.format(user.unknown_sizes) + "."));
+  const listing = el("ol", "listing usage-history");
+  listing.hidden = true;
+  const actions = el("div", "usage-actions");
+  page.append(el("h2", "", "История запросов"), listing, actions);
+  screen.replaceChildren(page);
+  const title = heading.querySelector("h1");
+  title.tabIndex = -1;
+  title.focus({preventScroll: true});
+  window.scrollTo(0, 0);
+
+  async function loadPage(before = null) {
+    const loading = el("p", "assist", "Загружаем запросы…");
+    loading.setAttribute("role", "status");
+    actions.replaceChildren(loading);
+    const query = new URLSearchParams({days: usageDays, user_id: user.id});
+    if (before !== null) query.set("before", before);
+    try {
+      const data = await api("usage?" + query);
+      if (!page.isConnected) return;
+      const fragment = document.createDocumentFragment();
+      for (const entry of data.requests) {
+        const row = el("li", "usage-entry");
+        const file = entry.kind === "file";
+        const status = {pending: "В обработке", accepted: "Принят", rejected: "Отклонён"}[entry.status];
+        const name = file ? "Файл" : "/resume";
+        row.append(el("strong", "", name + " · " + status), el("time", "assist", usageDate.format(entry.sent_at * 1000)));
+        if (file) {
+          const facts = [entry.size_bytes === null ? "Размер неизвестен" : fileSize(entry.size_bytes)];
+          if (entry.receipts !== null) facts.push("Чеков " + numberRu.format(entry.receipts));
+          if (entry.lines !== null) facts.push("Строк " + numberRu.format(entry.lines));
+          row.append(el("span", "row-meta", facts.join(" · ")));
+        }
+        fragment.append(row);
+      }
+      listing.append(fragment);
+      listing.hidden = !listing.childElementCount;
+      actions.replaceChildren();
+      if (listing.hidden) actions.append(el("p", "assist", "За этот период запросов нет."));
+      if (data.next_before !== null) {
+        actions.append(button("Показать ещё", "button", () => loadPage(data.next_before)));
+      }
+      if (before !== null && data.requests.length) {
+        const firstNew = listing.children[listing.children.length - data.requests.length];
+        firstNew.tabIndex = -1;
+        firstNew.focus({preventScroll: true});
+      }
+    } catch (error) {
+      usageFailure(actions, error, () => loadPage(before));
+    }
+  }
+  loadPage();
 }
 
 function hoursForm() {

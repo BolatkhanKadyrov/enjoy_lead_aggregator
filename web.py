@@ -120,12 +120,43 @@ class WebApp:
             result["employees"] = [p for p in self.store.staff_list() if p["id"] != str(uid)]
         return result
 
+    def usage(self, query):
+        if len(query) > 160:
+            raise ValueError("Слишком длинный запрос статистики.")
+        try:
+            pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+        except ValueError:
+            raise ValueError("Проверьте параметры статистики.") from None
+        params = dict(pairs)
+        if len(params) != len(pairs) or params.keys() - {"days", "user_id", "before"}:
+            raise ValueError("Проверьте параметры статистики.")
+        days = params.get("days", "7")
+        if days not in ("1", "7", "30"):
+            raise ValueError("Выберите период за сегодня, 7 или 30 дней.")
+        if "user_id" not in params:
+            if "before" in params:
+                raise ValueError("Выберите отправителя для просмотра истории.")
+            return self.store.usage_summary(int(days), self.owner_id)
+        uid = employee_id(params["user_id"])
+        before = params.get("before")
+        if before is not None:
+            if not before.isascii() or not before.isdecimal() or not 0 < int(before) < 2**53:
+                raise ValueError("Проверьте номер страницы истории.")
+            before = int(before)
+        return self.store.usage_detail(int(days), uid, before)
+
     def api(self, env, path, method):
         user_id = signed_user(env.get("HTTP_AUTHORIZATION", ""), self.token)
         if user_id is None:
             return 401, {"error": "Сеанс истёк. Откройте настройки заново из бота."}
         if self.owner_id is None and user_id not in self.admin_ids:
             raise PermissionError
+        if path == "/api/usage":
+            if self.owner_id is None or user_id != self.owner_id:
+                raise PermissionError
+            if method != "GET":
+                return 405, {"error": "Статистика доступна для чтения."}
+            return 200, self.usage(env.get("QUERY_STRING", ""))
         if path == "/api/state" and method == "GET":
             with self.access(user_id) as grants:
                 return 200, self.visible_state(user_id, grants)

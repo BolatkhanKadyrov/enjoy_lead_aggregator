@@ -33,7 +33,8 @@ class AdminWebCase(unittest.TestCase):
     def request(self, path, body=None, auth=None):
         raw = json.dumps(body).encode() if body is not None else b""
         response = []
-        env = {"REQUEST_METHOD": "POST" if raw else "GET", "PATH_INFO": path,
+        path, _, query = path.partition("?")
+        env = {"REQUEST_METHOD": "POST" if raw else "GET", "PATH_INFO": path, "QUERY_STRING": query,
                "HTTP_AUTHORIZATION": self.signed() if auth is None else auth,
                "CONTENT_TYPE": "application/json", "CONTENT_LENGTH": str(len(raw)),
                "wsgi.input": io.BytesIO(raw)}

@@ -5,6 +5,7 @@ from http.client import HTTPException
 import json
 import logging
 from secrets import token_hex
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -17,6 +18,13 @@ from store import PERMISSIONS, IntakeLimits, key
 LOG = logging.getLogger(__name__)
 ZONE = ZoneInfo("Asia/Almaty")
 CHOICES_PER_PAGE = 12
+COMMANDS = {
+    "start": "Как отправить Excel и когда открыт приём",
+    "resume": "Продолжить последнюю выгрузку или повторно получить PDF",
+    "admin": "Открыть настройки цеха при наличии доступа",
+    "id": "Узнать свой Telegram ID",
+    "help": "Показать подсказки по командам",
+}
 
 
 class TelegramError(Exception):
@@ -29,6 +37,12 @@ class TelegramError(Exception):
     @property
     def transient(self):
         return self.code in (0, 409, 429) or self.code >= 500
+
+
+class FileTooLarge(ValueError):
+    def __init__(self, size_bytes=None):
+        super().__init__("Файл больше 10 МБ.")
+        self.size_bytes = size_bytes
 
 
 def multipart(fields, files):
@@ -65,8 +79,9 @@ class Telegram:
             body = json.dumps(fields).encode("utf-8")
             content_type = "application/json"
         request = Request(self.api_url + method, body, {"Content-Type": content_type})
+        timeout = 5 if method == "setMyCommands" else 75
         try:
-            with urlopen(request, timeout=75) as response:
+            with urlopen(request, timeout=timeout) as response:
                 payload = json.load(response)
         except HTTPError as error:
             try:
@@ -83,7 +98,7 @@ class Telegram:
     def download(self, file_id):
         info = self.call("getFile", {"file_id": file_id})
         if info.get("file_size", 0) > MAX_XLSX_BYTES:
-            raise ValueError("Файл больше 10 МБ.")
+            raise FileTooLarge(info["file_size"])
         path = info.get("file_path")
         if not path:
             raise ValueError("Telegram не вернул файл. Отправьте его ещё раз.")
@@ -95,7 +110,8 @@ class Telegram:
         except (OSError, URLError, HTTPException):
             raise TelegramError() from None
         if len(data) > MAX_XLSX_BYTES:
-            raise ValueError("Файл больше 10 МБ.")
+            # We stopped reading at the limit and do not know the full file size.
+            raise FileTooLarge()
         return data
 
 
@@ -147,12 +163,24 @@ class Bot:
 
     def run(self, stop_event):
         webhook_removed = False
+        next_menu_attempt = 0
         delay = 1
         while not stop_event.is_set():
             try:
                 if not webhook_removed:
                     self.api.call("deleteWebhook", {"drop_pending_updates": False})
                     webhook_removed = True
+                if next_menu_attempt is not None and monotonic() >= next_menu_attempt:
+                    try:
+                        self.api.call("setMyCommands", {
+                            "scope": {"type": "all_private_chats"},
+                            "commands": [{"command": name, "description": hint} for name, hint in COMMANDS.items()],
+                        })
+                    except TelegramError as error:
+                        LOG.warning("Could not update the command menu (Telegram status %d)", error.code)
+                        next_menu_attempt = monotonic() + max(300, error.retry_after)
+                    else:
+                        next_menu_attempt = None
                 updates = self.api.call("getUpdates", {
                     "offset": self.store.get_offset(), "limit": 10, "timeout": 25 if self.connected else 0,
                     "allowed_updates": ["message", "callback_query"],
@@ -201,7 +229,8 @@ class Bot:
         if self.operator_ids and self.permissions(uid) is None:
             if not callback:
                 reason = str(uid) if command == "/id" else (
-                    f"Доступ к боту ограничен. Передайте владельцу бота ваш Telegram ID: {uid}"
+                    f"Доступ к боту ограничен. Передайте владельцу бота ваш Telegram ID: {uid}\n"
+                    "/id — узнать свой ID."
                 )
                 self.refuse(uid, message, reason)
             return
@@ -211,6 +240,8 @@ class Bot:
         elif command == "/id":
             self.say(uid, str(uid))
         elif message.get("media_group_id"):
+            if "document" in message:
+                self.record_request(uid, message, "rejected")
             self.refuse(uid, message, "Файлы отправлены альбомом. Отправьте одну полную выгрузку XLSX отдельным сообщением.")
         elif "document" in message:
             self.upload(uid, message)
@@ -233,7 +264,15 @@ class Bot:
             }]]}
         self.say(uid, f"Отправьте полную выгрузку за день одним файлом .xlsx. "
                  f"Принимаю файлы каждый день с {hours['start']} до {hours['end']} по времени Астаны. "
-                 "В ответ вы получите план производства и накладные.", markup)
+                 "В ответ вы получите план производства и накладные.\n\n/help — подсказки по командам.", markup)
+
+    def command_help(self, uid):
+        can_open_settings = self.public_url and self.permissions(uid)
+        hints = [f"/{name} — {hint}" for name, hint in COMMANDS.items()
+                 if name != "admin" or can_open_settings]
+        if uid == self.owner_id and can_open_settings:
+            hints.append("\nСтатистика сотрудников доступна через /admin → Настройки цеха → Статистика.")
+        self.say(uid, "\n".join(hints))
 
     def refuse(self, uid, message, reason):
         sent_at = message["date"]
@@ -248,19 +287,30 @@ class Bot:
                 self.store.release_notice(uid, sent_at, album=album)
             raise
 
+    def record_request(self, uid, message, status):
+        document = message.get("document")
+        kind = "file" if document is not None else "resume"
+        size = document.get("file_size") if document is not None else None
+        self.store.record_usage(uid, message["message_id"], message["date"], kind, status, size_bytes=size)
+
+    def reject_request(self, uid, message, reason):
+        self.record_request(uid, message, "rejected")
+        self.refuse(uid, message, reason)
+
     def admit(self, uid, message, *, resume=False):
         message_id = message["message_id"]
         wait, replay = self.store.reserve_work(uid, message_id, message["date"], self.limits, resume=resume)
         if wait is not None:
             action = "Команду /resume" if resume else "Файл Excel"
             when = f"через {wait} сек." if wait else "сейчас."
-            self.refuse(uid, message, f"Достигнут лимит обработки. {action} можно отправить ещё раз {when}")
+            self.reject_request(uid, message, f"Достигнут лимит обработки. {action} можно отправить ещё раз {when}")
             return False
         if replay:
             error = self.store.work_error(uid, message_id)
             if error:
                 self.refuse(uid, message, error)
                 return False
+        self.record_request(uid, message, "accepted" if resume else "pending")
         return True
 
     def upload(self, uid, message):
@@ -277,22 +327,31 @@ class Bot:
             opening = sent.date()
             if clock > hours["end"]:
                 opening += timedelta(days=1)
-            self.refuse(uid, message, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. "
-                        f"Приём открыт ежедневно с {hours['start']} до {hours['end']}.\n"
-                        f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
-                        "Отправьте Excel ещё раз в часы приёма.")
+            self.reject_request(uid, message, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. "
+                                f"Приём открыт ежедневно с {hours['start']} до {hours['end']}.\n"
+                                f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
+                                "Отправьте Excel ещё раз в часы приёма.")
             return
         document = message["document"]
         if not document.get("file_name", "").casefold().endswith(".xlsx"):
-            self.refuse(uid, message, "Нужен файл выгрузки с расширением .xlsx.")
+            self.reject_request(uid, message, "Нужен файл выгрузки с расширением .xlsx.")
             return
         if document.get("file_size", 0) > MAX_XLSX_BYTES:
-            self.refuse(uid, message, "Выгрузка не принята. Файл больше 10 МБ.")
+            self.reject_request(uid, message, "Выгрузка не принята. Файл больше 10 МБ.")
             return
         if not self.admit(uid, message):
             return
+        size = document.get("file_size")
+        discard_size_estimate = False
         try:
-            receipts = parse_workbook(self.api.download(document["file_id"]))
+            raw = self.api.download(document["file_id"])
+            size = len(raw)
+            receipts = parse_workbook(raw)
+        except FileTooLarge as error:
+            size = error.size_bytes
+            # A bounded read crossed the limit despite Telegram's smaller estimate.
+            discard_size_estimate = size is None
+            failure = f"Выгрузка не принята. {error}"
         except ValueError as error:
             failure = f"Выгрузка не принята. {str(error)[:600]}"
         except TelegramError as error:
@@ -300,30 +359,38 @@ class Bot:
                 raise
             failure = "Telegram не передал файл. Отправьте Excel ещё раз."
         else:
-            self.store.replace_job(uid, version, receipts, sent.date().isoformat())
+            self.store.replace_job(uid, version, receipts, sent.date().isoformat(),
+                                   usage_sent_at=message["date"], usage_size_bytes=size)
+            del raw
             self.advance(uid, self.store.get_job(uid))
             return
-        self.store.record_work_error(uid, message["message_id"], failure)
+        self.store.record_work_error(uid, message["message_id"], failure,
+                                     usage_sent_at=message["date"], usage_size_bytes=size,
+                                     discard_size_estimate=discard_size_estimate)
         self.refuse(uid, message, failure)
 
     def on_text(self, uid, message, command):
         text = message["text"].strip()
-        if command in ("/start", "/help", "/admin"):
+        if command in ("/help", "/"):
+            self.command_help(uid)
+            return
+        if command in ("/start", "/admin"):
             self.welcome(uid, settings_requested=command == "/admin")
             return
         if command == "/resume":
             version = self.store.job_version(uid)
             if version is None:
+                self.record_request(uid, message, "rejected")
                 self.welcome(uid)
             elif message["message_id"] > int(version) and self.admit(uid, message, resume=True):
                 self.advance(uid, self.store.get_job(uid))
             return
+        if command.startswith("/"):
+            self.say(uid, "Такой команды нет. Введите /help, чтобы посмотреть список команд.")
+            return
         job = self.store.get_job(uid)
         if not job:
             self.welcome(uid)
-            return
-        if command.startswith("/"):
-            self.say(uid, "Отправьте Excel или используйте /resume, чтобы вернуться к последней выгрузке.")
             return
         prompt = job.get("pending")
         if job["status"] != "question" or not prompt or not prompt.get("message_id"):

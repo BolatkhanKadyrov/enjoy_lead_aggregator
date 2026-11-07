@@ -7,7 +7,9 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, time as wall_time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 class Conflict(ValueError):
@@ -31,6 +33,19 @@ class IntakeLimits:
 INTAKE_RETENTION = 48 * 3600
 PERMISSIONS = ("point_addresses", "invoice_exclusions", "dishes", "sections", "hours")
 MAX_TELEGRAM_ID = 2**52 - 1
+USAGE_PERIODS = (1, 7, 30)
+USAGE_PAGE_SIZE = 25
+ASTANA = ZoneInfo("Asia/Almaty")
+
+
+def usage_window(days):
+    if type(days) is not int or days not in USAGE_PERIODS:
+        raise ValueError("Выберите период 1, 7 или 30 дней.")
+    today = datetime.fromtimestamp(time.time(), ASTANA).date()
+    first = today - timedelta(days=days - 1)
+    start = datetime.combine(first, wall_time.min, ASTANA)
+    stop = datetime.combine(today + timedelta(days=1), wall_time.min, ASTANA)
+    return first.isoformat(), int(start.timestamp()), int(stop.timestamp())
 
 
 def clean(value, label, limit, *, empty=False):
@@ -118,6 +133,14 @@ CREATE TABLE IF NOT EXISTS intake_album_notices (
     PRIMARY KEY(user_id,album)
 );
 CREATE INDEX IF NOT EXISTS album_notices_age ON intake_album_notices(notified_at);
+CREATE TABLE IF NOT EXISTS usage_events (
+    user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, sent_at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('file','resume')),
+    status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected')),
+    size_bytes INTEGER, receipts INTEGER, lines INTEGER, PRIMARY KEY(user_id,message_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS usage_time ON usage_events(sent_at);
+CREATE INDEX IF NOT EXISTS usage_pending ON usage_events(status) WHERE status='pending';
 """
 
 
@@ -132,6 +155,8 @@ class Store:
             conn.executescript(SCHEMA)
         defaults = json.loads(Path(__file__).with_name("seed.json").read_text(encoding="utf-8"))
         with self.connection(write=True) as conn:
+            conn.execute("INSERT OR IGNORE INTO config VALUES ('usage_started_at',?)", (str(int(time.time())),))
+            conn.execute("DELETE FROM usage_events WHERE sent_at<?", (usage_window(max(USAGE_PERIODS))[1],))
             if not conn.execute("SELECT 1 FROM config WHERE key='initialized'").fetchone():
                 for name in defaults["sections"]:
                     self._section(conn, name)
@@ -368,7 +393,7 @@ class Store:
             check_previous(previous, {"section": row[0]})
             conn.execute("UPDATE dishes SET section_key=? WHERE key=?", (section_key, dish))
 
-    def replace_job(self, user_id, version, receipts, collected):
+    def replace_job(self, user_id, version, receipts, collected, *, usage_sent_at=None, usage_size_bytes=None):
         with self.connection(write=True) as conn:
             conn.execute(
                 "INSERT INTO jobs VALUES (?,?,?,?,'processing',NULL) ON CONFLICT(user_id) DO UPDATE SET "
@@ -377,6 +402,9 @@ class Store:
                 (user_id, version, json.dumps(receipts, ensure_ascii=False), collected)
             )
             conn.execute("DELETE FROM job_answers WHERE user_id=?", (user_id,))
+            if usage_sent_at is not None:
+                self._record_usage(conn, user_id, int(version), usage_sent_at, "file", "accepted",
+                                   usage_size_bytes, len(receipts), sum(len(r["lines"]) for r in receipts))
 
     def save_local_answer(self, uid, version, kind, name, value):
         """Keep an answer with its private upload when shared editing is unavailable."""
@@ -470,10 +498,87 @@ class Store:
                                (uid, message_id)).fetchone()
             return row[0] if row else None
 
-    def record_work_error(self, uid, message_id, detail):
+    def record_work_error(self, uid, message_id, detail, *, usage_sent_at=None, usage_size_bytes=None,
+                          discard_size_estimate=False):
         with self.connection(write=True) as conn:
             conn.execute("UPDATE intake SET error=? WHERE user_id=? AND message_id=?",
                          (detail, uid, message_id))
+            if usage_sent_at is not None:
+                self._record_usage(conn, uid, message_id, usage_sent_at, "file", "rejected", usage_size_bytes,
+                                   None, None, discard_size_estimate=discard_size_estimate)
+
+    @staticmethod
+    def _record_usage(conn, uid, message_id, sent_at, kind, status, size_bytes, receipts, lines,
+                      *, discard_size_estimate=False):
+        # Store request metadata only. Retries share the original message's identity.
+        cutoff = usage_window(max(USAGE_PERIODS))[1]
+        conn.execute("DELETE FROM usage_events WHERE sent_at<?", (cutoff,))
+        if sent_at < cutoff:
+            return
+        conn.execute("""
+            INSERT INTO usage_events(user_id,message_id,sent_at,kind,status,size_bytes,receipts,lines)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,message_id) DO UPDATE SET
+                status=excluded.status,
+                size_bytes=CASE WHEN ? THEN NULL ELSE COALESCE(excluded.size_bytes,usage_events.size_bytes) END,
+                receipts=COALESCE(excluded.receipts,usage_events.receipts),
+                lines=COALESCE(excluded.lines,usage_events.lines)
+            WHERE usage_events.kind=excluded.kind AND (usage_events.status='pending'
+                OR (usage_events.status='rejected' AND excluded.status IN ('pending','accepted')))
+        """, (uid, message_id, sent_at, kind, status, size_bytes, receipts, lines, discard_size_estimate))
+
+    def record_usage(self, uid, message_id, sent_at, kind, status, *, size_bytes=None, receipts=None, lines=None):
+        with self.connection(write=True) as conn:
+            self._record_usage(conn, uid, message_id, sent_at, kind, status, size_bytes, receipts, lines)
+
+    def usage_summary(self, days, owner_id):
+        since, start, stop = usage_window(days)
+        with self.connection() as conn:
+            started = conn.execute("SELECT value FROM config WHERE key='usage_started_at'").fetchone()[0]
+            rows = conn.execute("""
+                WITH totals AS (
+                    SELECT user_id,
+                        SUM(kind='file') AS files,
+                        SUM(kind='file' AND status='accepted') AS accepted,
+                        SUM(kind='file' AND status='rejected') AS rejected,
+                        SUM(kind='file' AND status='pending') AS pending,
+                        SUM(kind='resume') AS resumes,
+                        SUM(CASE WHEN kind='file' THEN size_bytes END) AS total_bytes,
+                        MAX(CASE WHEN kind='file' THEN size_bytes END) AS max_bytes,
+                        SUM(kind='file' AND size_bytes IS NULL) AS unknown_sizes,
+                        SUM(receipts) AS receipts, SUM(lines) AS lines
+                    FROM usage_events WHERE sent_at>=? AND sent_at<? GROUP BY user_id
+                ), senders AS (
+                    SELECT user_id FROM employees UNION SELECT user_id FROM totals UNION SELECT ?
+                )
+                SELECT CAST(senders.user_id AS TEXT) AS id,
+                    CASE WHEN senders.user_id=? THEN 'Владелец'
+                         ELSE COALESCE(employees.name,'Telegram '||senders.user_id) END AS name,
+                    COALESCE(files,0) AS files, COALESCE(accepted,0) AS accepted,
+                    COALESCE(rejected,0) AS rejected, COALESCE(pending,0) AS pending,
+                    COALESCE(resumes,0) AS resumes, COALESCE(total_bytes,0) AS total_bytes,
+                    max_bytes, COALESCE(unknown_sizes,0) AS unknown_sizes,
+                    COALESCE(receipts,0) AS receipts, COALESCE(lines,0) AS lines
+                FROM senders LEFT JOIN employees USING(user_id) LEFT JOIN totals USING(user_id)
+                ORDER BY files DESC, total_bytes DESC, resumes DESC, name, senders.user_id
+            """, (start, stop, owner_id, owner_id))
+            return {"since": since, "started_at": int(started), "users": [dict(row) for row in rows]}
+
+    def usage_detail(self, days, uid, before=None):
+        _, start, stop = usage_window(days)
+        uid = employee_id(uid)
+        if before is not None and (type(before) is not int or not 0 < before <= 2**63 - 1):
+            raise ValueError("Некорректная страница запросов.")
+        cursor_clause = "" if before is None else " AND message_id<?"
+        params = (uid, start, stop) if before is None else (uid, start, stop, before)
+        with self.connection() as conn:
+            records = conn.execute(f"""
+                SELECT message_id,sent_at,kind,status,size_bytes,receipts,lines
+                FROM usage_events WHERE user_id=? AND sent_at>=? AND sent_at<? {cursor_clause}
+                ORDER BY message_id DESC LIMIT ?
+            """, (*params, USAGE_PAGE_SIZE + 1)).fetchall()
+        page = [dict(row) for row in records[:USAGE_PAGE_SIZE]]
+        return {"requests": page, "next_before": page[-1]["message_id"] if len(records) > USAGE_PAGE_SIZE else None}
 
     def should_notify(self, uid, sent_at, *, album=None):
         """Coalesce refusal messages across polling retries, Telegram albums and restarts."""
@@ -520,5 +625,9 @@ class Store:
 
     def set_offset(self, n):
         with self.connection(write=True) as conn:
+            # One polling worker handles one update at a time. Reaching this
+            # point means no download is still running or waiting to be retried.
+            # Reconcile attempts whose update expired or whose sender lost access.
+            conn.execute("UPDATE usage_events SET status='rejected' WHERE status='pending'")
             conn.executemany("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
                              [("offset", str(n)), ("offset_saved_at", str(int(time.time())))])

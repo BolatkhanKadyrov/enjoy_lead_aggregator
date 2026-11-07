@@ -34,7 +34,7 @@ class RecoveryTests(unittest.TestCase):
         retry_readiness = []
 
         def poll(method, fields):
-            if method == "deleteWebhook":
+            if method in ("deleteWebhook", "setMyCommands"):
                 return True
             poll_readiness.append(bot.connected)
             reply = next(replies, None)

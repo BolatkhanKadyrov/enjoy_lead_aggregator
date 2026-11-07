@@ -49,6 +49,8 @@ class Transport:
     def call(self, method, fields, files=None):
         if method == "answerCallbackQuery":
             return True
+        if method == "setMyCommands":
+            return True
         if method == "sendMessage":
             msg = dict(fields, message_id=self.next_id())
             self.messages.append(msg)
