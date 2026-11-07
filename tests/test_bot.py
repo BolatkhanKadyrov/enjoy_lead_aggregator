@@ -12,6 +12,16 @@ from bot import Bot, TelegramError, ZONE, multipart
 from store import Store
 
 
+FRIDAY_START = int(datetime(2026, 10, 9, 20, tzinfo=ZONE).timestamp())
+
+
+def timestamp(value):
+    """Test times are local ISO dates or seconds after Friday's 20:00."""
+    if isinstance(value, int):
+        return FRIDAY_START + value
+    return int(datetime.fromisoformat(value).replace(tzinfo=ZONE).timestamp())
+
+
 def receipt(number, point="Кофейня", dish="Суп"):
     return {"id": str(number), "point": point, "gross": "200", "discount": "0", "paid": "200",
             "lines": [{"name": dish, "exchange": False, "qty": 1, "price": "200", "discount": "0", "total": "200"}]}
@@ -23,6 +33,7 @@ class Transport:
     def __init__(self):
         self.sequence = 0
         self.files = {}
+        self.downloads = []
         self.messages = []
         self.albums = []
         self.delivery_error = None
@@ -32,6 +43,7 @@ class Transport:
         return self.sequence
 
     def download(self, file_id):
+        self.downloads.append(file_id)
         return self.files[file_id]
 
     def call(self, method, fields, files=None):
@@ -55,6 +67,8 @@ class BotTest(unittest.TestCase):
     def setUp(self):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.clock = patch("store.time.time", return_value=FRIDAY_START - 60).start()
+        self.addCleanup(patch.stopall)
         self.db_path = Path(tmp.name) / "orders.sqlite"
         self.store = Store(self.db_path)
         self.store.save_new_point("Кофейня", "Тестовый адрес")
@@ -64,17 +78,19 @@ class BotTest(unittest.TestCase):
         self.bot.api = self.tg
         self.parse = patch("bot.parse_workbook", side_effect=lambda raw: json.loads(raw)).start()
         self.draw = patch("bot.render_documents", return_value=(b"%PDF-plan", b"%PDF-invoices")).start()
-        self.addCleanup(patch.stopall)
 
-    def message(self, uid=100, when="2026-10-09 20:00", **kwargs):
-        sent = datetime.fromisoformat(when).replace(tzinfo=ZONE)
-        return {"message_id": self.tg.next_id(), "date": int(sent.timestamp()), "from": {"id": uid},
+    def message(self, uid=100, when=None, processed=None, **kwargs):
+        sent = self.clock.return_value + 60 if when is None else timestamp(when)
+        sent = kwargs.pop("date", sent)
+        self.clock.return_value = sent if processed is None else timestamp(processed)
+        return {"message_id": self.tg.next_id(), "date": sent, "from": {"id": uid},
                 "chat": {"id": uid, "type": "private"}, **kwargs}
 
-    def upload(self, rows, uid=100, when="2026-10-09 20:00"):
+    def upload(self, rows, uid=100, when=None, processed=None, **message_fields):
         file_id = str(len(self.tg.files))
         self.tg.files[file_id] = json.dumps(rows).encode()
-        msg = self.message(uid, when, document={"file_id": file_id, "file_name": "orders.XLSX"})
+        msg = self.message(uid, when, processed, document={"file_id": file_id, "file_name": "orders.XLSX"},
+                           **message_fields)
         self.bot.handle({"message": msg})
         return msg
 
@@ -100,21 +116,22 @@ class BotTest(unittest.TestCase):
         self.assertEqual(len(self.tg.albums), 3, "replayed Telegram update must not send a second album")
 
     def test_submission_hours_weekend_and_invalid_upload_preserve_latest(self):
+        self.upload([receipt(3)], when="2026-10-08 17:59")
         self.upload([receipt(1)], when="2026-10-08 18:00:00")
         self.upload([receipt(2)], when="2026-10-08 23:30:59")
-        for when in ("2026-10-08 17:59", "2026-10-08 23:31", "2026-10-10 19:00"):
-            self.upload([receipt(3)], when=when)
+        self.upload([receipt(3)], when="2026-10-08 23:31")
         self.store.set_settings("17:00", "19:00")
         self.upload([receipt(4)], when="2026-10-09 17:15")
         self.parse.side_effect = ValueError("неверный заголовок")
-        self.upload([receipt(99)], when="2026-10-09 17:15")
+        self.upload([receipt(99)], when="2026-10-09 17:16")
         self.assertIn("неверный заголовок", self.tg.messages[-1]["text"])
+        self.upload([receipt(3)], when="2026-10-10 19:00")
         self.assertEqual([r["id"] for r in self.store.get_job(100)["receipts"]], ["4"])
         self.assertEqual(len(self.tg.albums), 3)
 
     def test_weekend_refusal_uses_telegram_timestamp_in_astana(self):
-        for utc, local_time in (("2026-11-07T17:45:00+00:00", "22:45"),
-                                ("2026-11-06T19:15:00+00:00", "00:15")):
+        for utc, local_time in (("2026-11-06T19:15:00+00:00", "00:15"),
+                                ("2026-11-07T17:45:00+00:00", "22:45")):
             with self.subTest(utc=utc):
                 message = self.message(date=int(datetime.fromisoformat(utc).timestamp()),
                                        document={"file_id": "unused", "file_name": "day.xlsx"})
@@ -132,6 +149,142 @@ class BotTest(unittest.TestCase):
             self.assertIn(detail, reply)
         self.assertNotIn("выходной", reply)
         self.parse.assert_not_called()
+
+    def test_multiple_files_in_one_telegram_album_are_rejected_before_download(self):
+        self.upload([receipt(1)], when=0)
+        for when in (40, 40, 41):
+            self.upload([receipt(2)], when=when, media_group_id="album")
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertEqual(self.tg.downloads, ["0"])
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+
+    def test_album_warning_is_retried_when_telegram_definitively_rejects_send(self):
+        first = self.message(when=0, document={"file_id": "unused", "file_name": "one.xlsx"},
+                             media_group_id="group")
+        with patch.object(self.tg, "call", side_effect=TelegramError(429, 2)):
+            with self.assertRaises(TelegramError):
+                self.bot.handle({"message": first})
+        self.assertFalse(self.tg.messages)
+        self.clock.return_value = timestamp(2)
+        self.bot.handle({"message": first})
+        self.assertEqual(len(self.tg.messages), 1)
+        # The next member of the same album remains silent even past the notice cooldown.
+        self.upload([receipt(1)], when=40, media_group_id="group")
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertFalse(self.tg.downloads)
+
+    def test_invalid_file_consumes_slot_and_replay_does_not_download_it_again(self):
+        self.upload([receipt(1)], when=0)
+        self.parse.side_effect = ValueError("Неверная выгрузка")
+        invalid = self.upload([receipt(2)], when=30)
+        self.bot.handle({"message": invalid})
+        self.assertEqual(self.tg.downloads, ["0", "1"])
+        self.parse.side_effect = lambda raw: json.loads(raw)
+        self.upload([receipt(3)], when=59)
+        self.assertEqual(self.tg.downloads, ["0", "1"])
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+        self.upload([receipt(4)], when=60)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(4)])
+
+    def test_telegram_download_retry_reuses_the_same_reservation(self):
+        file_body = json.dumps([receipt(1)]).encode()
+        msg = self.message(when=0, document={"file_id": "retry", "file_name": "retry.xlsx"})
+        with patch.object(self.tg, "download", side_effect=[TelegramError(429, 1), file_body]) as download:
+            with self.assertRaises(TelegramError):
+                self.bot.handle({"message": msg})
+            self.bot.handle({"message": msg})
+            self.assertEqual(download.call_count, 2)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+        self.assertEqual(len(self.tg.albums), 1)
+
+    def test_resume_refreshes_a_question_answered_in_another_chat(self):
+        first = self.upload([receipt(1, dish="Общее блюдо")], when=0)
+        self.upload([receipt(2, dish="Общее блюдо")], uid=200, when=1)
+        self.bot.handle({"message": self.message(200, when=2, text="Горячее")})
+        self.assertEqual([fields["chat_id"] for fields, _ in self.tg.albums], [200])
+        self.bot.handle({"message": self.message(when=30, text="/resume")})
+        self.assertEqual([fields["chat_id"] for fields, _ in self.tg.albums], [200, 100])
+        self.assertEqual(self.store.get_job(100)["version"], str(first["message_id"]))
+        self.assertEqual(self.store.get_job(100)["status"], "done")
+
+    def test_rejections_do_not_send_a_warning_for_every_message_or_delay_next_upload(self):
+        self.upload([receipt(1)], when=0)
+        for when in (1, 2, 3, 29):
+            self.upload([receipt(2)], when=when)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.assertEqual(self.tg.downloads, ["0"])
+        self.assertEqual(self.draw.call_count, 1)
+        self.upload([receipt(5)], when=30)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(5)])
+
+    def test_per_sender_rolling_quota_survives_worker_restart(self):
+        for index in range(5):
+            self.upload([receipt(index)], when=30 * index)
+        self.bot = Bot(Store(self.db_path), "test", set(), "")
+        self.bot.api = self.tg
+        self.upload([receipt(8)], when=150)
+        self.upload([receipt(9)], when=599)
+        self.assertEqual(len(self.tg.downloads), 5)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(4)])
+        self.upload([receipt(10)], when=600)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(10)])
+
+    def test_submit_cooldown_holds_while_old_messages_are_processed_slowly(self):
+        self.upload([receipt(1)], when=0, processed=120)
+        self.upload([receipt(2)], when=1, processed=181)
+        self.assertEqual(len(self.tg.downloads), 1)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+
+    def test_backlogged_refusal_allows_a_new_message_now_when_both_windows_have_elapsed(self):
+        self.upload([receipt(1)], when=0)
+        self.upload([receipt(2)], when=1, processed=61)
+        self.assertIn("сейчас", self.tg.messages[-1]["text"].lower())
+        self.assertEqual(len(self.tg.downloads), 1)
+        self.upload([receipt(3)], when=61)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(3)])
+
+    def test_replayed_processing_time_refusal_does_not_become_an_accepted_upload(self):
+        self.upload([receipt(1)], when=0, processed=120)
+        denied = self.upload([receipt(2)], when=100, processed=121)
+        self.assertEqual(len(self.tg.downloads), 1)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+        self.clock.return_value = timestamp(350)
+        self.bot.handle({"message": denied})
+        self.assertEqual(len(self.tg.downloads), 1)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+        self.upload([receipt(3)], when=350)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(3)])
+
+    def test_global_limit_by_submission_time(self):
+        for sender in range(11):
+            self.upload([receipt(1)], uid=100 + sender, when=0, processed=30 * sender)
+        self.assertEqual(len(self.tg.downloads), 10)
+        self.assertIsNone(self.store.get_job(110))
+        self.upload([receipt(2)], uid=110, when=60, processed=360)
+        self.assertEqual(self.store.get_job(110)["receipts"], [receipt(2)])
+
+    def test_global_limit_by_processing_time_with_queued_submissions(self):
+        for sender in range(11):
+            self.upload([receipt(1)], uid=100 + sender, when=30 * sender, processed=600)
+        self.assertEqual(len(self.tg.downloads), 10)
+        self.assertIsNone(self.store.get_job(110))
+        self.upload([receipt(2)], uid=110, when=660, processed=660)
+        self.assertEqual(self.store.get_job(110)["receipts"], [receipt(2)])
+
+    def test_resume_shares_quota_with_files_and_duplicate_update_is_idempotent(self):
+        self.upload([receipt(1)], when=0)
+        self.bot.handle({"message": self.message(when=5, text="/resume")})
+        self.assertEqual(len(self.tg.albums), 1)
+        allowed = self.message(when=30, text="/resume")
+        self.bot.handle({"message": allowed})
+        self.bot.handle({"message": allowed})
+        self.assertEqual(len(self.tg.albums), 2)
+        self.assertEqual(self.draw.call_count, 2)
+        self.upload([receipt(2)], when=59)
+        self.assertEqual(len(self.tg.downloads), 1)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(1)])
+        self.upload([receipt(3)], when=60)
+        self.assertEqual(self.store.get_job(100)["receipts"], [receipt(3)])
 
     def test_replies_stale_callbacks_and_new_section_survive_restart(self):
         self.upload([receipt(1, "Точка A", "Новое A")])
@@ -157,20 +310,22 @@ class BotTest(unittest.TestCase):
         self.assertEqual(len(self.tg.albums), 2)
 
     def test_button_section_and_typed_address(self):
-        self.upload([receipt(1, "Точка В", "Блюдо В")])
+        self.upload([receipt(1, "Точка В", "Блюдо В")], when=0)
         prompt = self.tg.messages[-1]
         section = prompt["reply_markup"]["inline_keyboard"][0][0]["text"]
         self.press(prompt)
-        self.bot.handle({"message": self.message(text="Проспект 12")})
+        self.bot.handle({"message": self.message(when=2, text="Проспект 12")})
         self.assertEqual(self.store.catalog()["dishes"]["блюдо в"], section)
         self.assertEqual(self.store.catalog()["points"]["точка в"]["address"], "Проспект 12")
         self.assertEqual(len(self.tg.albums), 1)
 
     def test_delivery_retry_and_admin_mini_app_only_in_private_chat(self):
         self.tg.delivery_error = TelegramError(503)
-        self.upload([receipt(2)])
+        self.upload([receipt(2)], when=0)
         self.assertEqual(self.store.get_job(100)["status"], "retry")
-        self.bot.handle({"message": self.message(text="/resume")})
+        self.bot.handle({"message": self.message(when=5, text="/resume")})
+        self.assertFalse(self.tg.albums)
+        self.bot.handle({"message": self.message(when=30, text="/resume")})
         self.assertEqual(len(self.tg.albums), 1)
         for uid in (100, 500):
             self.bot.handle({"message": self.message(uid=uid, text="/start")})

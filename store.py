@@ -3,12 +3,31 @@
 import json
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class Conflict(ValueError):
     """Another administrator changed the entry since it was opened."""
+
+
+@dataclass(frozen=True)
+class IntakeLimits:
+    """Seconds between requests, requests per sender per 10 min, requests per service per min."""
+    cooldown: int = 30
+    per_user: int = 5
+    global_rate: int = 10
+
+    def __post_init__(self):
+        for name, high in (("cooldown", 86400), ("per_user", 10000), ("global_rate", 10000)):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= high:
+                raise ValueError(f"{name}: допустимы целые значения от 1 до {high}.")
+
+
+INTAKE_RETENTION = 48 * 3600
 
 
 def clean(value, label, limit, *, empty=False):
@@ -44,6 +63,27 @@ CREATE TABLE IF NOT EXISTS jobs (
     user_id INTEGER PRIMARY KEY, version TEXT NOT NULL, receipts TEXT NOT NULL,
     collected TEXT NOT NULL, status TEXT NOT NULL, pending TEXT
 );
+CREATE TABLE IF NOT EXISTS intake (
+    user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, sent_at INTEGER NOT NULL,
+    reserved_at INTEGER NOT NULL, error TEXT, PRIMARY KEY(user_id,message_id)
+);
+CREATE INDEX IF NOT EXISTS intake_sender_sent ON intake(user_id,sent_at);
+CREATE INDEX IF NOT EXISTS intake_sender_reserved ON intake(user_id,reserved_at);
+CREATE INDEX IF NOT EXISTS intake_sent ON intake(sent_at);
+CREATE INDEX IF NOT EXISTS intake_reserved ON intake(reserved_at);
+CREATE TABLE IF NOT EXISTS intake_denials (
+    user_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, eligible_at INTEGER NOT NULL, decided_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS denials_age ON intake_denials(decided_at);
+CREATE TABLE IF NOT EXISTS intake_notices (
+    user_id INTEGER PRIMARY KEY, sent_at INTEGER NOT NULL, notified_at INTEGER NOT NULL, album TEXT
+);
+CREATE INDEX IF NOT EXISTS notices_age ON intake_notices(notified_at);
+CREATE TABLE IF NOT EXISTS intake_album_notices (
+    user_id INTEGER NOT NULL, album TEXT NOT NULL, notified_at INTEGER NOT NULL, sent_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id,album)
+);
+CREATE INDEX IF NOT EXISTS album_notices_age ON intake_album_notices(notified_at);
 """
 
 
@@ -158,8 +198,16 @@ class Store:
                 conn.execute("INSERT INTO dishes VALUES (?,?,?)", (key(name), name, section_key))
 
     def save_new_point(self, name, address):
+        name = clean(name, "Точка", 500)
+        address = clean(address, "Адрес", 500, empty=True)
         with self.connection(write=True) as conn:
-            self._insert_point(conn, {"name": name, "address": address})
+            # Two chats can receive the address question before either one replies.
+            conn.execute(
+                "INSERT INTO points (key,name,address,excluded) VALUES (?,?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET address=excluded.address "
+                "WHERE points.address='' AND excluded.address<>''",
+                (key(name), name, address),
+            )
 
     def edit_point(self, name, address, excluded, previous=None):
         point = key(clean(name, "Точка", 500))
@@ -201,6 +249,95 @@ class Store:
                 return None
             return dict(row, receipts=json.loads(row["receipts"]), pending=json.loads(row["pending"] or "null"))
 
+    def job_version(self, user_id):
+        with self.connection() as conn:
+            row = conn.execute("SELECT version FROM jobs WHERE user_id=?", (user_id,)).fetchone()
+            return row[0] if row else None
+
+    @staticmethod
+    def _quota_deadline(conn, column, clock, window, quota, user_id=None):
+        # The quota-th newest reservation is the first one that must age out.
+        # column is always a literal column name supplied by reserve_work.
+        where = f"{column}>?"
+        args = [clock - window]
+        if user_id is not None:
+            where += " AND user_id=?"
+            args.append(user_id)
+        row = conn.execute(f"SELECT {column} FROM intake WHERE {where} "
+                           f"ORDER BY {column} DESC LIMIT 1 OFFSET ?", (*args, quota - 1)).fetchone()
+        return row[0] + window if row else 0
+
+    def reserve_work(self, uid, message_id, sent_at, limits, *, resume=False):
+        """Return (None for admission or seconds until a fresh send, replay of a saved decision)."""
+        with self.connection(write=True) as conn:
+            now = int(time.time())
+            cutoff = now - INTAKE_RETENTION
+            conn.execute("DELETE FROM intake WHERE reserved_at<=?", (cutoff,))
+            conn.execute("DELETE FROM intake_denials WHERE decided_at<=?", (cutoff,))
+            identity = (uid, message_id)
+            if conn.execute("SELECT 1 FROM intake WHERE user_id=? AND message_id=?", identity).fetchone():
+                return None, True
+            prior = conn.execute("SELECT eligible_at FROM intake_denials WHERE user_id=? AND message_id=?",
+                                 identity).fetchone()
+            if prior:
+                return max(0, prior[0] - now), True
+
+            deadline = 0
+            for column, clock in (("sent_at", sent_at), ("reserved_at", now)):
+                deadline = max(deadline,
+                               self._quota_deadline(conn, column, clock, limits.cooldown, 1, uid),
+                               self._quota_deadline(conn, column, clock, 600, limits.per_user, uid),
+                               self._quota_deadline(conn, column, clock, 60, limits.global_rate))
+            if deadline:
+                # Polling acknowledges one update before it moves to the next.
+                # Retain the last denial without allocating a row per burst message.
+                conn.execute("INSERT OR REPLACE INTO intake_denials VALUES (?,?,?,?)",
+                             (uid, message_id, deadline, now))
+                return max(0, deadline - now), False
+            conn.execute("INSERT INTO intake(user_id,message_id,sent_at,reserved_at) VALUES (?,?,?,?)",
+                         (uid, message_id, sent_at, now))
+            if resume:
+                conn.execute("UPDATE jobs SET status='processing',pending=NULL WHERE user_id=?", (uid,))
+            return None, False
+
+    def work_error(self, uid, message_id):
+        with self.connection() as conn:
+            row = conn.execute("SELECT error FROM intake WHERE user_id=? AND message_id=?",
+                               (uid, message_id)).fetchone()
+            return row[0] if row else None
+
+    def record_work_error(self, uid, message_id, detail):
+        with self.connection(write=True) as conn:
+            conn.execute("UPDATE intake SET error=? WHERE user_id=? AND message_id=?",
+                         (detail, uid, message_id))
+
+    def should_notify(self, uid, sent_at, *, album=None):
+        """Coalesce refusal messages across polling retries, Telegram albums and restarts."""
+        with self.connection(write=True) as conn:
+            now = int(time.time())
+            cutoff = now - INTAKE_RETENTION
+            conn.execute("DELETE FROM intake_notices WHERE notified_at<=?", (cutoff,))
+            conn.execute("DELETE FROM intake_album_notices WHERE notified_at<=?", (cutoff,))
+            last = conn.execute("SELECT sent_at,notified_at FROM intake_notices WHERE user_id=?", (uid,)).fetchone()
+            if last and (sent_at - last["sent_at"] < 30 or now - last["notified_at"] < 30):
+                return False
+            if album is not None:
+                inserted = conn.execute("INSERT OR IGNORE INTO intake_album_notices VALUES (?,?,?,?)",
+                                        (uid, album, now, sent_at)).rowcount
+                if not inserted:
+                    return False
+            conn.execute("INSERT OR REPLACE INTO intake_notices VALUES (?,?,?,?)", (uid, sent_at, now, album))
+            return True
+
+    def release_notice(self, uid, sent_at, *, album=None):
+        """Release only this notification when Telegram definitively declined delivery."""
+        with self.connection(write=True) as conn:
+            conn.execute("DELETE FROM intake_notices WHERE user_id=? AND sent_at=? AND album IS ?",
+                         (uid, sent_at, album))
+            if album is not None:
+                conn.execute("DELETE FROM intake_album_notices WHERE user_id=? AND sent_at=? AND album=?",
+                             (uid, sent_at, album))
+
     def update_job(self, user_id, version, status, pending=None):
         with self.connection(write=True) as conn:
             return bool(conn.execute("UPDATE jobs SET status=?,pending=? WHERE user_id=? AND version=?",
@@ -208,8 +345,16 @@ class Store:
 
     def get_offset(self):
         with self.connection() as conn:
-            return int(conn.execute("SELECT value FROM config WHERE key='offset'").fetchone()[0])
+            cursor = dict(conn.execute("SELECT key,value FROM config WHERE key IN ('offset','offset_saved_at')"))
+        # Telegram retains pending updates for 24h and can pick a lower ID after a week
+        # of inactivity. After 48h (or on upgrade from an undated cursor), ask for
+        # the earliest unconfirmed update before acknowledging any newer IDs.
+        saved_at = cursor.get("offset_saved_at")
+        if saved_at is None or time.time() - int(saved_at) >= 48 * 3600:
+            return 0
+        return int(cursor["offset"])
 
     def set_offset(self, n):
         with self.connection(write=True) as conn:
-            conn.execute("UPDATE config SET value=? WHERE key='offset'", (str(n),))
+            conn.executemany("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                             [("offset", str(n)), ("offset_saved_at", str(int(time.time())))])

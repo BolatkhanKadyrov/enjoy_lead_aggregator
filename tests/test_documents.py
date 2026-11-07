@@ -1,6 +1,7 @@
 import unittest
 from datetime import date
 from io import BytesIO
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from openpyxl import Workbook
@@ -124,6 +125,11 @@ class DocumentsTest(unittest.TestCase):
                 archive.writestr(str(i),'')
         with self.assertRaisesRegex(ValueError,'слишком велико'):
             parse_workbook(buf.getvalue())
+
+    def test_unsupported_zip_version_is_an_input_error(self):
+        with patch('documents.ZipFile', side_effect=NotImplementedError('unsupported ZIP version')):
+            with self.assertRaisesRegex(ValueError, 'Сохраните книгу заново в формате XLSX'):
+                parse_workbook(b'example')
 
 
 if __name__ == '__main__':

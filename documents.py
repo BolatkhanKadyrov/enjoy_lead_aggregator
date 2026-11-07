@@ -133,6 +133,9 @@ def parse_workbook(data: bytes) -> list[dict]:
                 raise ValueError('Файл XLSX защищён паролем.')
     except BadZipFile:
         raise ValueError('Файл должен быть книгой Excel в формате XLSX.') from None
+    except NotImplementedError:
+        # zipfile can reject an unsupported ZIP version while reading its directory.
+        raise ValueError('Неподдерживаемый формат архива. Сохраните книгу заново в формате XLSX.') from None
     try:
         workbook = load_workbook(BytesIO(data), read_only=True, data_only=True, keep_links=False)
     except Exception as exc:

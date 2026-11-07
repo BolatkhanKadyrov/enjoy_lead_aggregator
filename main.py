@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from waitress import create_server
 
 from bot import Bot
-from store import Store
+from store import IntakeLimits, Store
 from web import WebApp
 
 
@@ -44,7 +44,13 @@ def main():
         seed_value = seed_file.read_text(encoding="utf-8-sig")
     store = Store(data_dir / "enjoy.sqlite3", initial_catalog=json.loads(seed_value) if seed_value else None,
                   require_catalog=bool(os.getenv("RAILWAY_SERVICE_ID")))
-    bot = Bot(store, token, ids, public_url)
+    defaults = IntakeLimits()
+    limits = IntakeLimits(
+        cooldown=int(os.getenv("UPLOAD_COOLDOWN_SECONDS", defaults.cooldown)),
+        per_user=int(os.getenv("UPLOADS_PER_USER_PER_10_MINUTES", defaults.per_user)),
+        global_rate=int(os.getenv("UPLOADS_PER_MINUTE_TOTAL", defaults.global_rate)),
+    )
+    bot = Bot(store, token, ids, public_url, limits=limits)
     stop = threading.Event()
     worker = threading.Thread(target=bot.run, args=(stop,), name="telegram-poller", daemon=True)
     app = WebApp(store, token, ids, ready=lambda: worker.is_alive() and bot.connected)

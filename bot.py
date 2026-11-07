@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from documents import MAX_BYTES as MAX_XLSX_BYTES, parse_workbook, render_documents
-from store import key
+from store import IntakeLimits, key
 
 
 LOG = logging.getLogger(__name__)
@@ -120,10 +120,11 @@ def question_for(receipts, catalog):
 
 
 class Bot:
-    def __init__(self, store, token, admin_ids, public_url):
+    def __init__(self, store, token, admin_ids, public_url, *, limits=None):
         self.store = store
         self.api = Telegram(token)
         self.admin_ids = set(admin_ids)
+        self.limits = limits if limits is not None else IntakeLimits()
         self.connected = False
         public_url = public_url or ""
         parsed = urlsplit(public_url)
@@ -136,18 +137,19 @@ class Bot:
         return self.api.call("sendMessage", data)
 
     def run(self, stop_event):
-        ready = False
+        webhook_removed = False
         delay = 1
         while not stop_event.is_set():
             try:
-                if not ready:
+                if not webhook_removed:
                     self.api.call("deleteWebhook", {"drop_pending_updates": False})
-                    ready = True
-                    self.connected = True
+                    webhook_removed = True
                 updates = self.api.call("getUpdates", {
-                    "offset": self.store.get_offset(), "limit": 10, "timeout": 25,
+                    "offset": self.store.get_offset(), "limit": 10, "timeout": 25 if self.connected else 0,
                     "allowed_updates": ["message", "callback_query"],
                 })
+                if not updates:
+                    self.connected = True
                 for update in updates:
                     if stop_event.is_set():
                         self.connected = False
@@ -160,16 +162,18 @@ class Bot:
                         LOG.warning("Telegram rejected update %d (HTTP %d)", update["update_id"], error.code)
                     # Advance only after persisting the effect of this update.
                     self.store.set_offset(update["update_id"] + 1)
+                    self.connected = True
                 delay = 1
             except TelegramError as error:
+                self.connected = False
                 if error.code in (401, 404, 409):
-                    self.connected = False
-                    ready = False
+                    webhook_removed = False
                 LOG.warning("Polling paused (Telegram status %d)", error.code)
                 stop_event.wait(max(delay, error.retry_after))
                 delay = min(delay * 2, 60)
             except Exception as error:
                 # Keep the cursor for database errors and unexpected failures.
+                self.connected = False
                 LOG.error("Polling paused (%s)", type(error).__name__)
                 stop_event.wait(delay)
                 delay = min(delay * 2, 60)
@@ -186,12 +190,14 @@ class Bot:
 
         if callback:
             self.on_callback(uid, callback, message)
+        elif message.get("media_group_id"):
+            self.refuse(uid, message, "Файлы отправлены альбомом. Отправьте одну полную выгрузку XLSX отдельным сообщением.")
         elif "document" in message:
             self.upload(uid, message)
         elif "text" in message:
             self.on_text(uid, message)
         else:
-            self.say(uid, "Отправьте выгрузку Excel в формате .xlsx как файл.")
+            self.refuse(uid, message, "Отправьте выгрузку Excel в формате .xlsx как файл.")
 
     def welcome(self, uid):
         hours = self.store.settings()
@@ -200,15 +206,44 @@ class Bot:
             markup = {"inline_keyboard": [[{
                 "text": "Настройки цеха", "web_app": {"url": self.public_url}
             }]]}
-        self.say(uid, f"Отправьте полную выгрузку за день в формате .xlsx. "
+        self.say(uid, f"Отправьте полную выгрузку за день одним файлом .xlsx. "
                  f"Принимаю файлы по будням с {hours['start']} до {hours['end']} по времени Астаны. "
                  "В ответ вы получите план производства и накладные.", markup)
 
+    def refuse(self, uid, message, reason):
+        sent_at = message["date"]
+        album = message.get("media_group_id")
+        if not self.store.should_notify(uid, sent_at, album=album):
+            return
+        try:
+            self.say(uid, reason)
+        except TelegramError as error:
+            if error.code in (401, 429):
+                # Telegram explicitly declined delivery. Retry the notice with this update.
+                self.store.release_notice(uid, sent_at, album=album)
+            raise
+
+    def admit(self, uid, message, *, resume=False):
+        message_id = message["message_id"]
+        wait, replay = self.store.reserve_work(uid, message_id, message["date"], self.limits, resume=resume)
+        if wait is not None:
+            action = "Команду /resume" if resume else "Файл Excel"
+            when = f"через {wait} сек." if wait else "сейчас."
+            self.refuse(uid, message, f"Достигнут лимит обработки. {action} можно отправить ещё раз {when}")
+            return False
+        if replay:
+            error = self.store.work_error(uid, message_id)
+            if error:
+                self.refuse(uid, message, error)
+                return False
+        return True
+
     def upload(self, uid, message):
         version = str(message["message_id"])
-        job = self.store.get_job(uid)
-        if job and job["version"] == version:
-            self.advance(uid, job)
+        current = self.store.job_version(uid)
+        if current is not None and message["message_id"] <= int(current):
+            if version == current:
+                self.advance(uid, self.store.get_job(uid))
             return
         sent = datetime.fromtimestamp(message["date"], ZONE)
         hours = self.store.settings()
@@ -223,28 +258,33 @@ class Bot:
                 reason = f"Это {day_name}, приём файлов закрыт на выходные."
             else:
                 reason = f"В будни приём открыт с {hours['start']} до {hours['end']}."
-            self.say(uid, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. {reason}\n"
-                     f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
-                     "Отправьте Excel ещё раз в часы приёма.")
+            self.refuse(uid, message, f"Вы отправили файл {sent:%d.%m.%Y в %H:%M} по времени Астаны. {reason}\n"
+                        f"Ближайший приём откроется {opening:%d.%m.%Y} в {hours['start']}. "
+                        "Отправьте Excel ещё раз в часы приёма.")
             return
         document = message["document"]
         if not document.get("file_name", "").casefold().endswith(".xlsx"):
-            self.say(uid, "Нужен файл выгрузки с расширением .xlsx.")
+            self.refuse(uid, message, "Нужен файл выгрузки с расширением .xlsx.")
+            return
+        if document.get("file_size", 0) > MAX_XLSX_BYTES:
+            self.refuse(uid, message, "Выгрузка не принята. Файл больше 10 МБ.")
+            return
+        if not self.admit(uid, message):
             return
         try:
-            if document.get("file_size", 0) > MAX_XLSX_BYTES:
-                raise ValueError("Файл больше 10 МБ.")
             receipts = parse_workbook(self.api.download(document["file_id"]))
         except ValueError as error:
-            self.say(uid, f"Выгрузка не принята. {str(error)[:600]}")
-            return
+            failure = f"Выгрузка не принята. {str(error)[:600]}"
         except TelegramError as error:
-            if error.transient:
+            if error.transient or error.code == 401:
                 raise
-            self.say(uid, "Telegram не передал файл. Отправьте Excel ещё раз.")
+            failure = "Telegram не передал файл. Отправьте Excel ещё раз."
+        else:
+            self.store.replace_job(uid, version, receipts, sent.date().isoformat())
+            self.advance(uid, self.store.get_job(uid))
             return
-        self.store.replace_job(uid, version, receipts, sent.date().isoformat())
-        self.advance(uid, self.store.get_job(uid))
+        self.store.record_work_error(uid, message["message_id"], failure)
+        self.refuse(uid, message, failure)
 
     def on_text(self, uid, message):
         text = message["text"].strip()
@@ -252,12 +292,16 @@ class Bot:
         if command in ("/start", "/help", "/admin"):
             self.welcome(uid)
             return
+        if command == "/resume":
+            version = self.store.job_version(uid)
+            if version is None:
+                self.welcome(uid)
+            elif message["message_id"] > int(version) and self.admit(uid, message, resume=True):
+                self.advance(uid, self.store.get_job(uid))
+            return
         job = self.store.get_job(uid)
         if not job:
             self.welcome(uid)
-            return
-        if command == "/resume":
-            self.resume(uid, job)
             return
         if command.startswith("/"):
             self.say(uid, "Отправьте Excel или используйте /resume, чтобы вернуться к последней выгрузке.")
@@ -276,13 +320,6 @@ class Bot:
                 self.say(uid, "Этот вопрос уже закрыт. Ответьте на последний вопрос бота.")
             return
         self.answer(uid, job, text)
-
-    def resume(self, uid, job):
-        if job["status"] == "question" and job.get("pending"):
-            self.prompt(uid, job, job["pending"])
-        else:
-            self.store.update_job(uid, job["version"], "processing")
-            self.advance(uid, self.store.get_job(uid))
 
     def acknowledge(self, callback_id):
         try:
