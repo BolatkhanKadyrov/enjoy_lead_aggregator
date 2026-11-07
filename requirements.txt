@@ -1,0 +1,5 @@
+openpyxl==3.1.5
+reportlab==4.4.9
+defusedxml==0.7.1
+waitress==3.0.2
+tzdata>=2025.2,<2028

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Управление цехом · Enjoy</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="mast">
+    <div class="wrap brand">
+      <span class="brand-name" lang="en">Enjoy</span>
+      <span class="brand-purpose">Управление цехом</span>
+    </div>
+  </header>
+  <div class="nav-band" id="nav-band" hidden>
+    <nav class="wrap navigation" aria-label="Управление цехом">
+      <button type="button" data-view="points" aria-current="page">Точки</button>
+      <button type="button" data-view="dishes">Блюда</button>
+      <button type="button" data-view="hours">Приём файлов</button>
+    </nav>
+  </div>
+  <main class="wrap workspace">
+    <div id="notice" role="status" hidden></div>
+    <div id="screen" aria-busy="true">
+      <h1>Загружаем справочники…</h1>
+      <div class="loading-lines" aria-hidden="true"><i></i><i></i><i></i></div>
+    </div>
+    <noscript>Для работы справочников включите JavaScript и откройте приложение из чата с ботом.</noscript>
+  </main>
+</body>
+</html>
